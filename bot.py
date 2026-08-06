@@ -1,1198 +1,634 @@
-"""
-BOT PENCATAT KEUANGAN - TELEGRAM (MULTI-USER)
-==============================================
-Setiap user pakai Google Spreadsheet MILIK SENDIRI.
-Mapping user -> spreadsheet disimpan di sheet "Users" pada spreadsheet master
-(milik pemilik bot).
-
-Perintah:
-  /start           -> panduan
-  /daftar <id>     -> hubungkan spreadsheet milik user
-  /info            -> lihat spreadsheet yang terhubung
-  /catat <nominal> <kategori> <catatan>
-  /masuk  <nominal> <catatan>
-  kirim foto struk -> dibaca AI
-
-Sheet yang dibuat otomatis di spreadsheet user:
-  Pengeluaran : Tanggal | Kategori | Nominal | Merchant | Sumber | Catatan | Tipe Bayar
-  Pemasukan   : Tanggal | Kategori | Nominal | Sumber   | Catatan
-"""
-
-import logging
-import json
-import re
-import os
-import uuid
-from datetime import datetime
-
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
-import google.generativeai as genai
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-    filters,
-)
-
-# ==========================================
-# KONFIGURASI
-# ==========================================
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-
-# Spreadsheet MASTER milik pemilik bot -> tempat menyimpan daftar user
-MASTER_SPREADSHEET_ID = os.environ.get("MASTER_SPREADSHEET_ID", "")
-USERS_SHEET = os.environ.get("USERS_SHEET", "Users")
-
-# Nama sheet di spreadsheet masing-masing user
-SHEET_PENGELUARAN = os.environ.get("SHEET_PENGELUARAN", "Pengeluaran")
-SHEET_PEMASUKAN = os.environ.get("SHEET_PEMASUKAN", "Pemasukan")
-SHEET_DASHBOARD = os.environ.get("SHEET_DASHBOARD", "Dashboard")
-
-CREDENTIALS_FILE = "credentials.json"
-GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON", "")
-
-if GOOGLE_CREDENTIALS_JSON:
-    with open(CREDENTIALS_FILE, "w") as f:
-        f.write(GOOGLE_CREDENTIALS_JSON)
-
-# Email service account, dipakai untuk instruksi share ke user
-try:
-    with open(CREDENTIALS_FILE) as f:
-        SERVICE_ACCOUNT_EMAIL = json.load(f).get("client_email", "(cek credentials.json)")
-except Exception:
-    SERVICE_ACCOUNT_EMAIL = "(cek credentials.json)"
-
-HEADER_PENGELUARAN = ["Tanggal", "Kategori", "Nominal", "Merchant",
-                      "Sumber", "Catatan", "Tipe Bayar"]
-HEADER_PEMASUKAN = ["Tanggal", "Kategori", "Nominal", "Sumber", "Catatan"]
-HEADER_USERS = ["user_id", "username", "spreadsheet_id", "tanggal_daftar"]
-
-# ==========================================
-# LOGGING
-# ==========================================
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
-
-# ==========================================
-# GEMINI
-# ==========================================
-genai.configure(api_key=GEMINI_API_KEY)
-gemini_model = genai.GenerativeModel("gemini-2.5-flash")
-
-# ==========================================
-# GOOGLE SHEETS
-# ==========================================
-_client = None
-
-
-def get_client():
-    """Satu koneksi gspread dipakai berulang, supaya tidak auth tiap request."""
-    global _client
-    if _client is None:
-        scope = [
-            "https://spreadsheets.google.com/feeds",
-            "https://www.googleapis.com/auth/drive",
-        ]
-        creds = ServiceAccountCredentials.from_json_keyfile_name(CREDENTIALS_FILE, scope)
-        _client = gspread.authorize(creds)
-    return _client
-
-
-def get_or_create_worksheet(spreadsheet, nama, header):
-    """Ambil worksheet; kalau belum ada, buat sekalian dengan headernya."""
-    try:
-        return spreadsheet.worksheet(nama)
-    except gspread.WorksheetNotFound:
-        ws = spreadsheet.add_worksheet(title=nama, rows=1000, cols=len(header) + 3)
-        ws.append_row(header, value_input_option="USER_ENTERED")
-        return ws
-
-
-
-# ------------------------------------------
-# Dashboard otomatis di spreadsheet user
-# ------------------------------------------
-# CATATAN PENTING SOAL FORMULA
-# Google Sheets memakai pemisah argumen yang berbeda tergantung lokal:
-#   en_US        -> koma      : SUM(A1, B1)   array: {A1, B1}
-#   id_ID / dll  -> titik koma: SUM(A1; B1)   array: {A1 \\ B1}
-# Semua template di bawah memakai penanda netral:
-#   ~  = pemisah argumen
-#   ^  = pemisah kolom pada array literal
-# Koma di dalam string QUERY ("select A, sum(C)") sengaja dibiarkan apa adanya
-# karena itu bagian dari bahasa QUERY, bukan pemisah argumen formula.
-
-T_KEY_PERIODE = '=TEXT(EDATE(TODAY()~IF(DAY(TODAY())>=25~0~-1))~"YYYY-MM")'
-
-T_LABEL_PERIODE = (
-    '=IF(DAY(TODAY())>=25~'
-    'TEXT(DATE(YEAR(TODAY())~MONTH(TODAY())~25)~"d mmm")&" - "&'
-    'TEXT(DATE(YEAR(TODAY())~MONTH(TODAY())+1~24)~"d mmm yyyy")~'
-    'TEXT(DATE(YEAR(TODAY())~MONTH(TODAY())-1~25)~"d mmm")&" - "&'
-    'TEXT(DATE(YEAR(TODAY())~MONTH(TODAY())~24)~"d mmm yyyy"))'
-)
-
-
-def _t_helper(sheet):
-    """Label periode 25-24 untuk tiap baris transaksi."""
-    return (
-        '=ARRAYFORMULA(IF({s}!A2:A5000=""~""~'
-        'TEXT(EDATE({s}!A2:A5000~IF(DAY({s}!A2:A5000)>=25~0~-1))~"YYYY-MM")))'
-    ).format(s=sheet)
-
-
-def deteksi_pemisah(ss):
-    """Tentukan pemisah argumen dari lokal spreadsheet.
-    Lokal yang memakai koma sebagai desimal (id_ID, de_DE, ...) memakai ';'."""
-    try:
-        locale = (ss.fetch_sheet_metadata()
-                  .get("properties", {}).get("locale", "en_US"))
-    except Exception:
-        locale = "en_US"
-    if locale.startswith(("en", "ms", "ja", "ko", "zh", "th", "he", "iw")):
-        return ",", ","
-    return ";", "\\"
-
-
-def _isi_dashboard(ws, sep, colsep):
-    """Tulis semua formula ke sheet Dashboard memakai pemisah yang sesuai."""
-
-    def f(t):
-        return t.replace("~", sep).replace("^", colsep)
-
-    P, M = SHEET_PENGELUARAN, SHEET_PEMASUKAN
-
-    ws.batch_update([
-        # --- Blok ringkasan (A:B) ---
-        {"range": "A1", "values": [["  RINGKASAN PERIODE BERJALAN"]]},
-        {"range": "A2:A6", "values": [
-            ["Periode"], ["Total Pemasukan"], ["Total Pengeluaran"],
-            ["Selisih"], ["Rata-rata Harian"],
-        ]},
-        {"range": "B2", "values": [[f(T_LABEL_PERIODE)]]},
-        {"range": "B3", "values": [[f(
-            '=SUMIF($M$2:$M$5000~$K$1~' + M + '!$C$2:$C$5000)')]]},
-        {"range": "B4", "values": [[f(
-            '=SUMIF($L$2:$L$5000~$K$1~' + P + '!$C$2:$C$5000)')]]},
-        {"range": "B5", "values": [["=B3-B4"]]},
-        {"range": "B6", "values": [[f(
-            '=IFERROR(B4/COUNTA(UNIQUE(FILTER(' + P + '!$A$2:$A$5000~'
-            '$L$2:$L$5000=$K$1)))~0)')]]},
-
-        # --- Blok pengeluaran per kategori (A8:B) ---
-        {"range": "A8", "values": [["  PENGELUARAN PER KATEGORI"]]},
-        {"range": "A9:B9", "values": [["Kategori", "Total"]]},
-        {"range": "A10", "values": [[f(
-            '=IFERROR(SORT(UNIQUE(FILTER($N$2:$N$5000~'
-            '$N$2:$N$5000<>""))~1~TRUE)~"")')]]},
-        {"range": "B10", "values": [[f(
-            '=ARRAYFORMULA(IF($A$10:$A$40=""~""~'
-            'SUMIF($N$2:$N$5000~$A$10:$A$40~'
-            + P + '!$C$2:$C$5000)))')]]},
-
-        # --- Blok rekap harian (D:E) ---
-        {"range": "D1", "values": [["  REKAP HARIAN"]]},
-        {"range": "D2", "values": [[f(
-            '=IFERROR(QUERY(' + P + '!A2:C5000~'
-            '"select A, sum(C) where A is not null '
-            'group by A order by A desc '
-            "label A 'Tanggal', sum(C) 'Total'\"~0)~\"\")"
-        )]]},
-
-        # --- Blok riwayat per periode (G:I) ---
-        {"range": "G1", "values": [["  RIWAYAT PER PERIODE"]]},
-        {"range": "G2:I2", "values": [["Periode", "Pengeluaran", "Pemasukan"]]},
-        {"range": "G3", "values": [[f(
-            '=IFERROR(SORT(UNIQUE(FILTER($L$2:$L$5000~'
-            '$L$2:$L$5000<>""))~1~FALSE)~"")')]]},
-        {"range": "H3", "values": [[f(
-            '=ARRAYFORMULA(IF($G$3:$G$300=""~""~'
-            'SUMIF($L$2:$L$5000~$G$3:$G$300~' + P + '!$C$2:$C$5000)))')]]},
-        {"range": "I3", "values": [[f(
-            '=ARRAYFORMULA(IF($G$3:$G$300=""~""~'
-            'SUMIF($M$2:$M$5000~$G$3:$G$300~' + M + '!$C$2:$C$5000)))')]]},
-
-        # --- Sel bantuan (K:M), disembunyikan ---
-        {"range": "K1", "values": [[f(T_KEY_PERIODE)]]},
-        {"range": "L2", "values": [[f(_t_helper(P))]]},
-        {"range": "M2", "values": [[f(_t_helper(M))]]},
-        {"range": "N2", "values": [[f(
-            '=ARRAYFORMULA(IF(($L$2:$L$5000=$K$1)*'
-            '(' + P + '!$B$2:$B$5000<>"")~'
-            + P + '!$B$2:$B$5000~""))')]]},
-    ], value_input_option="USER_ENTERED")
-
-
-def _rapikan_dashboard(ss, ws):
-    sid = ws.id
-    judul = {"textFormat": {"bold": True, "fontSize": 10,
-                            "foregroundColor": {"red": 1, "green": 1, "blue": 1}},
-             "backgroundColor": {"red": 0.25, "green": 0.25, "blue": 0.25},
-             "verticalAlignment": "MIDDLE"}
-    tebal = {"textFormat": {"bold": True, "fontSize": 10},
-             "backgroundColor": {"red": 0.85, "green": 0.85, "blue": 0.85}}
-    angka = {"numberFormat": {"type": "NUMBER", "pattern": "#,##0"}}
-
-    def rng(r1, c1, r2, c2):
-        return {"sheetId": sid, "startRowIndex": r1, "endRowIndex": r2,
-                "startColumnIndex": c1, "endColumnIndex": c2}
-
-    def repeat(r, fmt, fields):
-        return {"repeatCell": {"range": r, "cell": {"userEnteredFormat": fmt},
-                               "fields": fields}}
-
-    reqs = [
-        {"mergeCells": {"range": rng(0, 0, 1, 2), "mergeType": "MERGE_ALL"}},
-        {"mergeCells": {"range": rng(0, 3, 1, 5), "mergeType": "MERGE_ALL"}},
-        {"mergeCells": {"range": rng(0, 6, 1, 9), "mergeType": "MERGE_ALL"}},
-        repeat(rng(0, 0, 1, 2), judul, "userEnteredFormat"),
-        repeat(rng(0, 3, 1, 5), judul, "userEnteredFormat"),
-        repeat(rng(0, 6, 1, 9), judul, "userEnteredFormat"),
-        {"mergeCells": {"range": rng(7, 0, 8, 2), "mergeType": "MERGE_ALL"}},
-        repeat(rng(7, 0, 8, 2), judul, "userEnteredFormat"),
-        repeat(rng(8, 0, 9, 2), tebal, "userEnteredFormat"),
-        repeat(rng(9, 1, 40, 2), angka, "userEnteredFormat.numberFormat"),
-        repeat(rng(1, 3, 2, 5), tebal, "userEnteredFormat"),
-        repeat(rng(1, 6, 2, 9), tebal, "userEnteredFormat"),
-        repeat(rng(2, 1, 6, 2), angka, "userEnteredFormat.numberFormat"),
-        repeat(rng(2, 3, 300, 4),
-               {"numberFormat": {"type": "DATE",
-                                 "pattern": "ddd, dd mmm yyyy"}},
-               "userEnteredFormat.numberFormat"),
-        repeat(rng(2, 4, 300, 5), angka, "userEnteredFormat.numberFormat"),
-        repeat(rng(2, 7, 300, 9), angka, "userEnteredFormat.numberFormat"),
-        repeat(rng(4, 0, 5, 2),
-               {"textFormat": {"bold": True, "fontSize": 10}},
-               "userEnteredFormat.textFormat"),
-        {"updateDimensionProperties": {
-            "range": {"sheetId": sid, "dimension": "COLUMNS",
-                      "startIndex": 10, "endIndex": 14},
-            "properties": {"hiddenByUser": True}, "fields": "hiddenByUser"}},
-        {"updateSheetProperties": {
-            "properties": {"sheetId": sid, "index": 0,
-                           "gridProperties": {"hideGridlines": True}},
-            "fields": "index,gridProperties.hideGridlines"}},
-    ]
-    for c1, c2, px in [(0, 1, 165), (1, 2, 135), (2, 3, 24),
-                       (3, 4, 150), (4, 5, 110), (5, 6, 24),
-                       (6, 7, 100), (7, 8, 120), (8, 9, 120)]:
-        reqs.append({"updateDimensionProperties": {
-            "range": {"sheetId": sid, "dimension": "COLUMNS",
-                      "startIndex": c1, "endIndex": c2},
-            "properties": {"pixelSize": px}, "fields": "pixelSize"}})
-
-    ss.batch_update({"requests": reqs})
-
-
-def rapikan_header(ss, ws, jumlah_kolom, warna):
-    """Percantik baris header sheet data: tebal, berwarna, dibekukan."""
-    sid = ws.id
-    lebar = {SHEET_PENGELUARAN: [(0, 1, 110), (1, 2, 120), (2, 3, 110),
-                                 (3, 4, 200), (4, 5, 85), (5, 6, 190),
-                                 (6, 7, 100)],
-             SHEET_PEMASUKAN: [(0, 1, 110), (1, 2, 165), (2, 3, 120),
-                               (3, 4, 85), (4, 5, 200)]}
-    reqs = [
-        {"repeatCell": {
-            "range": {"sheetId": sid, "startRowIndex": 0, "endRowIndex": 1,
-                      "startColumnIndex": 0, "endColumnIndex": jumlah_kolom},
-            "cell": {"userEnteredFormat": {
-                "backgroundColor": warna,
-                "horizontalAlignment": "CENTER",
-                "verticalAlignment": "MIDDLE",
-                "textFormat": {"bold": True, "fontSize": 10,
-                               "foregroundColor": {"red": 1, "green": 1, "blue": 1}}}},
-            "fields": "userEnteredFormat"}},
-        {"updateSheetProperties": {
-            "properties": {"sheetId": sid,
-                           "gridProperties": {"frozenRowCount": 1}},
-            "fields": "gridProperties.frozenRowCount"}},
-        {"repeatCell": {
-            "range": {"sheetId": sid, "startRowIndex": 1, "endRowIndex": 5000,
-                      "startColumnIndex": 2, "endColumnIndex": 3},
-            "cell": {"userEnteredFormat": {
-                "numberFormat": {"type": "NUMBER", "pattern": "#,##0"}}},
-            "fields": "userEnteredFormat.numberFormat"}},
-        {"repeatCell": {
-            "range": {"sheetId": sid, "startRowIndex": 1, "endRowIndex": 5000,
-                      "startColumnIndex": 0, "endColumnIndex": 1},
-            "cell": {"userEnteredFormat": {
-                "numberFormat": {"type": "DATE", "pattern": "yyyy-mm-dd"}}},
-            "fields": "userEnteredFormat.numberFormat"}},
-    ]
-    for c1, c2, px in lebar.get(ws.title, []):
-        reqs.append({"updateDimensionProperties": {
-            "range": {"sheetId": sid, "dimension": "COLUMNS",
-                      "startIndex": c1, "endIndex": c2},
-            "properties": {"pixelSize": px}, "fields": "pixelSize"}})
-    try:
-        ss.batch_update({"requests": reqs})
-    except Exception as e:
-        logger.error(f"Gagal merapikan header {ws.title}: {e}")
-
-
-def hapus_sheet_bawaan(ss):
-    """Hapus Sheet1 bawaan Google kalau memang kosong dan bukan satu-satunya."""
-    bawaan = {"sheet1", "sheet 1", "lembar1", "lembar 1"}
-    try:
-        semua = ss.worksheets()
-        if len(semua) <= 1:
-            return
-        for ws in semua:
-            if ws.title.strip().lower() in bawaan and not ws.get_all_values():
-                ss.del_worksheet(ws)
-                logger.info(f"Sheet bawaan '{ws.title}' dihapus")
-                break
-    except Exception as e:
-        logger.error(f"Gagal hapus sheet bawaan: {e}")
-
-
-SHEET_GRAFIK = os.environ.get("SHEET_GRAFIK", "Grafik")
-
-
-def setup_grafik(ss, dash_id):
-    """Buat sheet Grafik berisi 3 chart yang menarik data dari Dashboard."""
-    try:
-        ss.worksheet(SHEET_GRAFIK)
-        return False
-    except gspread.WorksheetNotFound:
-        pass
-
-    ws = ss.add_worksheet(title=SHEET_GRAFIK, rows=120, cols=12)
-    gid = ws.id
-
-    def sumber(r1, c1, r2, c2):
-        """Rentang data di sheet Dashboard."""
-        return {"sources": [{"sheetId": dash_id,
-                             "startRowIndex": r1, "endRowIndex": r2,
-                             "startColumnIndex": c1, "endColumnIndex": c2}]}
-
-    def posisi(baris):
-        return {"overlayPosition": {
-            "anchorCell": {"sheetId": gid, "rowIndex": baris, "columnIndex": 0},
-            "offsetXPixels": 10, "offsetYPixels": 10,
-            "widthPixels": 760, "heightPixels": 380}}
-
-    def sumbu(judul_x, judul_y):
-        return [{"position": "BOTTOM_AXIS", "title": judul_x},
-                {"position": "LEFT_AXIS", "title": judul_y}]
-
-    # 1. Pie: komposisi pengeluaran per kategori (periode berjalan)
-    pie = {"addChart": {"chart": {
-        "spec": {
-            "title": "Pengeluaran per Kategori — Periode Berjalan",
-            "pieChart": {
-                "legendPosition": "RIGHT_LEGEND",
-                "threeDimensional": False,
-                "pieHole": 0.4,
-                "domain": {"sourceRange": sumber(9, 0, 40, 1)},   # A10:A40
-                "series": {"sourceRange": sumber(9, 1, 40, 2)},   # B10:B40
-            }},
-        "position": posisi(0)}}}
-
-    # 2. Kolom: pengeluaran harian
-    harian = {"addChart": {"chart": {
-        "spec": {
-            "title": "Pengeluaran Harian",
-            "basicChart": {
-                "chartType": "COLUMN",
-                "legendPosition": "NO_LEGEND",
-                "headerCount": 1,
-                "axis": sumbu("Tanggal", "Rupiah"),
-                "domains": [{"domain": {"sourceRange": sumber(1, 3, 33, 4)}}],
-                "series": [{"series": {"sourceRange": sumber(1, 4, 33, 5)},
-                            "targetAxis": "LEFT_AXIS"}],
-            }},
-        "position": posisi(20)}}}
-
-    # 3. Kolom ganda: pemasukan vs pengeluaran tiap periode
-    periode = {"addChart": {"chart": {
-        "spec": {
-            "title": "Pemasukan vs Pengeluaran per Periode",
-            "basicChart": {
-                "chartType": "COLUMN",
-                "legendPosition": "BOTTOM_LEGEND",
-                "headerCount": 1,
-                "axis": sumbu("Periode", "Rupiah"),
-                "domains": [{"domain": {"sourceRange": sumber(1, 6, 20, 7)}}],
-                "series": [
-                    {"series": {"sourceRange": sumber(1, 8, 20, 9)},
-                     "targetAxis": "LEFT_AXIS"},   # Pemasukan
-                    {"series": {"sourceRange": sumber(1, 7, 20, 8)},
-                     "targetAxis": "LEFT_AXIS"},   # Pengeluaran
-                ],
-            }},
-        "position": posisi(40)}}}
-
-    try:
-        ss.batch_update({"requests": [
-            pie, harian, periode,
-            {"updateSheetProperties": {
-                "properties": {"sheetId": gid,
-                               "gridProperties": {"hideGridlines": True}},
-                "fields": "gridProperties.hideGridlines"}},
-        ]})
-    except Exception as e:
-        logger.error(f"Gagal membuat grafik: {e}")
-        return False
-    return True
-
-
-def setup_dashboard(ss):
-    """Buat sheet Dashboard berisi ringkasan otomatis.
-    Kalau sudah ada, dibiarkan supaya kustomisasi user tidak hilang."""
-    try:
-        return ss.worksheet(SHEET_DASHBOARD), False
-    except gspread.WorksheetNotFound:
-        pass
-
-    ws = ss.add_worksheet(title=SHEET_DASHBOARD, rows=300, cols=14)
-
-    sep, colsep = deteksi_pemisah(ss)
-    _isi_dashboard(ws, sep, colsep)
-
-    # Verifikasi: kalau sel bantuan K1 error, berarti tebakan pemisah salah.
-    # Tulis ulang memakai pemisah satunya.
-    try:
-        cek = ws.acell("K1", value_render_option="UNFORMATTED_VALUE").value
-        if isinstance(cek, str) and cek.startswith("#"):
-            alt = (";", "\\") if sep == "," else (",", ",")
-            logger.warning(f"Pemisah '{sep}' ditolak, coba '{alt[0]}'")
-            _isi_dashboard(ws, alt[0], alt[1])
-    except Exception as e:
-        logger.error(f"Gagal verifikasi formula dashboard: {e}")
-
-    _rapikan_dashboard(ss, ws)
-    return ws, True
-
-
-# ------------------------------------------
-# Daftar user (mapping user_id -> spreadsheet_id)
-# ------------------------------------------
-_user_map = None  # cache di memori
-
-
-def get_users_sheet():
-    ss = get_client().open_by_key(MASTER_SPREADSHEET_ID)
-    return get_or_create_worksheet(ss, USERS_SHEET, HEADER_USERS)
-
-
-def load_user_map(force=False):
-    global _user_map
-    if _user_map is not None and not force:
-        return _user_map
-    mapping = {}
-    try:
-        rows = get_users_sheet().get_all_records()
-        for r in rows:
-            uid = str(r.get("user_id", "")).strip()
-            sid = str(r.get("spreadsheet_id", "")).strip()
-            if uid and sid:
-                mapping[uid] = sid
-    except Exception as e:
-        logger.error(f"Gagal load daftar user: {e}")
-    _user_map = mapping
-    return _user_map
-
-
-def simpan_user(user_id, username, spreadsheet_id):
-    """Tambah user baru, atau update spreadsheet_id kalau user sudah pernah daftar."""
-    ws = get_users_sheet()
-    uid = str(user_id)
-    try:
-        cell = ws.find(uid, in_column=1)
-    except Exception:
-        cell = None
-    tgl = datetime.now().strftime("%Y-%m-%d %H:%M")
-    if cell:
-        ws.update(
-            f"A{cell.row}:D{cell.row}",
-            [[uid, username or "-", spreadsheet_id, tgl]],
-            value_input_option="USER_ENTERED",
-        )
-    else:
-        ws.append_row(
-            [uid, username or "-", spreadsheet_id, tgl],
-            value_input_option="USER_ENTERED",
-        )
-    load_user_map(force=True)
-
-
-def get_spreadsheet_id(user_id):
-    return load_user_map().get(str(user_id))
-
-
-# ------------------------------------------
-# Tulis transaksi ke spreadsheet milik user
-# ------------------------------------------
-def simpan_pengeluaran(user_id, tanggal, kategori, nominal, merchant,
-                       sumber, catatan, tipe_bayar):
-    sid = get_spreadsheet_id(user_id)
-    ss = get_client().open_by_key(sid)
-    ws = get_or_create_worksheet(ss, SHEET_PENGELUARAN, HEADER_PENGELUARAN)
-    ws.append_row(
-        [tanggal, kategori, nominal, merchant, sumber, catatan, tipe_bayar],
-        value_input_option="USER_ENTERED",
-    )
-
-
-def simpan_pemasukan(user_id, tanggal, kategori, nominal, sumber, catatan):
-    sid = get_spreadsheet_id(user_id)
-    ss = get_client().open_by_key(sid)
-    ws = get_or_create_worksheet(ss, SHEET_PEMASUKAN, HEADER_PEMASUKAN)
-    ws.append_row(
-        [tanggal, kategori, nominal, sumber, catatan],
-        value_input_option="USER_ENTERED",
-    )
-
-
-# ==========================================
-# DATA SEMENTARA
-# Pakai token unik per transaksi, supaya kirim beberapa struk sekaligus
-# tidak saling menimpa (bug versi sebelumnya).
-# ==========================================
-pending = {}  # token -> dict data
-
-
-def buat_token(data):
-    token = uuid.uuid4().hex[:10]
-    pending[token] = data
-    if len(pending) > 500:  # jaga-jaga supaya memori tidak menumpuk
-        for k in list(pending)[:100]:
-            pending.pop(k, None)
-    return token
-
-
-# ==========================================
-# KEYBOARD
-# ==========================================
-def keyboard_tipe_bayar(token):
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("💵 Cash", callback_data=f"bayar_cash|{token}"),
-        InlineKeyboardButton("💳 Pay Later", callback_data=f"bayar_paylater|{token}"),
-    ]])
-
-
-def keyboard_konfirmasi_struk(token):
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Simpan", callback_data=f"struk_simpan|{token}"),
-        InlineKeyboardButton("❌ Batal", callback_data=f"struk_batal|{token}"),
-    ]])
-
-
-KATEGORI_MASUK = {
-    "gaji": "💼 Gaji/Tunjangan",
-    "freelance": "💸 Freelance",
-    "bonus": "🎁 Bonus/THR",
-    "investasi": "📈 Investasi",
-    "transfer": "🔄 Transfer Masuk",
-    "lainnya": "📦 Lainnya",
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Keuangan — Hari Ini</title>
+
+<!-- Buka seperti aplikasi saat ditambahkan ke Home Screen (iPhone) -->
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<meta name="apple-mobile-web-app-title" content="Keuangan">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#0B1220">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link rel="icon" href="apple-touch-icon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700;12..96,800&family=Instrument+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+
+<style>
+:root{
+  --ink:#0B1220; --surface:#131D30; --surface-2:#1C2841; --line:#293752;
+  --blue:#54A8FF; --orange:#FF9A3D; --orange-deep:#FF7847;
+  --text:#E9F0FA; --muted:#8C9CB8; --faint:#5A6B88;
+  --display:"Bricolage Grotesque",system-ui,sans-serif;
+  --body:"Instrument Sans",system-ui,sans-serif;
+  --mono:"IBM Plex Mono",ui-monospace,monospace;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{
+  background:var(--ink);color:var(--text);font-family:var(--body);
+  -webkit-font-smoothing:antialiased;padding:0 0 48px;max-width:560px;margin:0 auto;
 }
 
+.top{padding:28px 20px 0;display:flex;align-items:baseline;justify-content:space-between;gap:12px}
+.eyebrow{font-family:var(--mono);font-size:10.5px;letter-spacing:.16em;text-transform:uppercase;color:var(--faint)}
+.periode{font-family:var(--mono);font-size:11.5px;color:var(--muted)}
 
-def keyboard_kategori_pemasukan(token):
-    keys = list(KATEGORI_MASUK.items())
-    rows = []
-    for i in range(0, len(keys), 2):
-        rows.append([
-            InlineKeyboardButton(label, callback_data=f"masuk_{kode}|{token}")
-            for kode, label in keys[i:i + 2]
-        ])
-    return InlineKeyboardMarkup(rows)
+/* ---------- hero: hari ini ---------- */
+.hero{
+  margin:16px 20px 0;background:var(--surface);border:1px solid var(--line);
+  border-radius:20px;padding:22px 22px 20px;
+}
+.hero-lbl{
+  font-family:var(--mono);font-size:10px;letter-spacing:.14em;
+  text-transform:uppercase;color:var(--faint);
+}
+.hero-tgl{font-size:12.5px;color:var(--muted);margin-top:3px}
+.hero-num{
+  font-family:var(--display);font-size:42px;font-weight:800;
+  letter-spacing:-.03em;line-height:1.05;margin-top:12px;
+  font-variant-numeric:tabular-nums;
+}
+.banding{
+  display:flex;align-items:center;gap:8px;margin-top:12px;
+  font-size:12.5px;color:var(--muted);line-height:1.45;
+}
+.pil{
+  font-family:var(--mono);font-size:11px;font-weight:500;
+  padding:3px 8px;border-radius:99px;white-space:nowrap;
+}
+.pil.atas{background:rgba(255,120,71,.15);color:var(--orange-deep)}
+.pil.bawah{background:rgba(84,168,255,.15);color:var(--blue)}
 
+/* baris total Pay Later di kartu hero — pengingat menahan diri */
+.hero-pl{
+  display:flex;align-items:baseline;justify-content:space-between;gap:12px;
+  margin-top:14px;padding-top:13px;border-top:1px solid var(--line);
+}
+.hero-pl:empty{display:none}
+.hero-pl .pl-lbl{
+  font-family:var(--mono);font-size:10px;letter-spacing:.13em;
+  text-transform:uppercase;color:var(--faint);
+}
+.hero-pl .pl-val{
+  font-family:var(--mono);font-size:15px;font-weight:600;letter-spacing:-.01em;
+  font-variant-numeric:tabular-nums;color:var(--muted);
+}
+.hero-pl.ada .pl-val{color:var(--orange-deep)}
 
-# ==========================================
-# PANDUAN PENDAFTARAN
-# ==========================================
-def pesan_belum_daftar():
-    return (
-        "🔐 *Kamu belum menghubungkan spreadsheet.*\n\n"
-        "Bot ini menulis ke Google Spreadsheet milikmu sendiri, "
-        "jadi datamu tidak tercampur dengan pengguna lain.\n\n"
-        "*Cara menghubungkan (5 menit):*\n\n"
-        "1️⃣ Buka Google Sheets, buat spreadsheet baru (boleh kosong).\n\n"
-        "2️⃣ Klik *Bagikan*, masukkan email ini sebagai *Editor*:\n"
-        f"`{SERVICE_ACCOUNT_EMAIL}`\n\n"
-        "3️⃣ Copy *ID spreadsheet* dari URL. Contoh URL:\n"
-        "`docs.google.com/spreadsheets/d/`*`1AbCdEfGh123`*`/edit`\n"
-        "yang dicetak tebal itu ID-nya.\n\n"
-        "4️⃣ Kirim ke saya:\n"
-        "`/daftar 1AbCdEfGh123`\n\n"
-        "Kolom, sheet, dan dashboard akan saya buat otomatis.\n"
-        "_Sheet1 bawaan boleh kamu hapus setelah terhubung._"
-    )
+/* ---------- statistik ---------- */
+.stat{margin:12px 20px 0;display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.kartu{
+  background:var(--surface);border:1px solid var(--line);
+  border-radius:14px;padding:14px 15px;
+}
+.kartu .l{
+  font-family:var(--mono);font-size:9.5px;letter-spacing:.13em;
+  text-transform:uppercase;color:var(--faint);
+}
+.kartu .v{
+  font-family:var(--mono);font-size:17px;font-weight:500;margin-top:6px;
+  font-variant-numeric:tabular-nums;letter-spacing:-.01em;
+}
+.kartu .s{font-size:11px;color:var(--muted);margin-top:3px}
 
+h2{
+  font-family:var(--mono);font-size:10.5px;font-weight:500;
+  letter-spacing:.16em;text-transform:uppercase;color:var(--faint);
+  margin:32px 20px 12px;display:flex;align-items:center;gap:10px;
+}
+h2::after{content:"";flex:1;height:1px;background:var(--line)}
 
-# ==========================================
-# HANDLER: /start
-# ==========================================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not get_spreadsheet_id(user_id):
-        await update.message.reply_text(pesan_belum_daftar(), parse_mode="Markdown")
-        return
-    await update.message.reply_text(
-        "👋 Halo! Saya bot pencatat keuangan kamu.\n\n"
-        "📝 *Cara pakai:*\n\n"
-        "1️⃣ *Pengeluaran manual*\n"
-        "`/catat 50000 Makan nasi goreng kantor`\n\n"
-        "2️⃣ *Pemasukan*\n"
-        "`/masuk 5000000 Gaji bulan ini`\n\n"
-        "3️⃣ *Dari struk*\n"
-        "Kirim foto struk, saya baca otomatis. Kirim satu foto per struk.\n\n"
-        "ℹ️ `/info` lihat spreadsheet yang terhubung\n"
-        "🧪 `/dummy` isi data contoh untuk mencoba Dashboard\n"
-        "🧹 `/hapusdummy` hapus lagi data contoh itu",
-        parse_mode="Markdown",
-    )
+/* ---------- transaksi hari ini ---------- */
+.trx{margin:0 20px}
+.trx-row{
+  display:grid;grid-template-columns:auto 1fr auto;gap:12px;
+  align-items:center;padding:12px 0;border-bottom:1px solid var(--line);
+}
+.trx-row:last-child{border-bottom:none}
+.trx-row.sisa{display:none}
+.trx.trx-buka .trx-row.sisa{display:grid}
+.trx-toggle{
+  display:block;width:100%;margin-top:2px;padding:12px 0 2px;
+  background:none;border:none;cursor:pointer;text-align:center;
+  font-family:var(--mono);font-size:11px;letter-spacing:.05em;color:var(--blue);
+}
+.trx-toggle:hover{color:var(--text)}
+.tanda{
+  width:34px;height:34px;border-radius:10px;background:var(--surface-2);
+  display:flex;align-items:center;justify-content:center;
+  font-family:var(--mono);font-size:11px;font-weight:600;color:var(--blue);
+}
+.trx-nama{font-size:14px;line-height:1.3}
+.trx-meta{font-size:11.5px;color:var(--faint);margin-top:2px}
+.trx-nilai{
+  font-family:var(--mono);font-size:14px;font-weight:500;
+  font-variant-numeric:tabular-nums;
+}
+.kosong{
+  margin:0 20px;background:var(--surface);border:1px dashed var(--line);
+  border-radius:14px;padding:22px;text-align:center;
+  font-size:13px;color:var(--muted);line-height:1.5;
+}
 
+/* ---------- grafik harian ---------- */
+.harian{
+  margin:0 20px;background:var(--surface);border:1px solid var(--line);
+  border-radius:16px;padding:18px 16px 12px;
+}
+.chart{display:flex;align-items:flex-end;gap:3px;height:120px;position:relative}
+.col{flex:1;display:flex;flex-direction:column;justify-content:flex-end;height:100%;cursor:pointer}
+.col i{display:block;width:100%;background:var(--orange);border-radius:3px 3px 1px 1px;min-height:2px;opacity:.78}
+.col.hi i{opacity:1;background:var(--orange-deep)}
+.col.kini i{opacity:1;background:var(--blue)}
+.garis{position:relative;height:0}
+.garis::before{
+  content:"";position:absolute;left:0;right:0;top:0;
+  border-top:1px dashed var(--faint);opacity:.45;
+}
+.xlab{display:flex;justify-content:space-between;font-family:var(--mono);font-size:9.5px;color:var(--faint);margin-top:9px}
+.catatan{font-size:12px;color:var(--muted);margin:11px 2px 0;line-height:1.5}
+.catatan b{color:var(--text);font-weight:600}
 
-# ==========================================
-# HANDLER: /daftar
-# ==========================================
-async def daftar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    args = context.args
+/* ---------- pemilih hari (rincian) ---------- */
+.rincian-head{display:flex;align-items:center;gap:10px;margin:32px 20px 12px}
+.rincian-head h2{margin:0}
+.rincian-head h2::after{display:none}
+.rincian-head .rule{flex:1;height:1px;background:var(--line)}
+#pilihHari{
+  flex:none;max-width:56%;
+  font-family:var(--mono);font-size:11px;color:var(--blue);
+  background:var(--surface-2);border:1px solid var(--line);border-radius:9px;
+  padding:7px 26px 7px 11px;cursor:pointer;-webkit-appearance:none;appearance:none;
+  background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 10 10'><path d='M2 3.5 L5 6.5 L8 3.5' stroke='%2354A8FF' fill='none' stroke-width='1.4' stroke-linecap='round' stroke-linejoin='round'/></svg>");
+  background-repeat:no-repeat;background-position:right 10px center;
+}
 
-    if not args:
-        await update.message.reply_text(pesan_belum_daftar(), parse_mode="Markdown")
-        return
+/* ---------- batang terpilih + tooltip ---------- */
+.col.pilih i{opacity:1;outline:2px solid rgba(233,240,250,.9);outline-offset:1px;border-radius:3px}
+.chart-tip{
+  position:absolute;transform:translateX(-50%);pointer-events:none;white-space:nowrap;
+  background:var(--surface-2);border:1px solid var(--line);border-radius:9px;
+  padding:5px 10px;box-shadow:0 8px 20px rgba(0,0,0,.4);
+  opacity:0;transition:opacity .15s;z-index:5;
+}
+.chart-tip.tampil{opacity:1}
+.chart-tip .tip-tgl{
+  display:block;font-family:var(--mono);font-size:9px;letter-spacing:.08em;
+  text-transform:uppercase;color:var(--faint);margin-bottom:1px;
+}
+.chart-tip .tip-val{font-family:var(--mono);font-size:12px;font-weight:600;color:var(--blue)}
 
-    raw = args[0].strip()
-    # Terima ID mentah maupun URL lengkap
-    m = re.search(r"/d/([a-zA-Z0-9-_]{20,})", raw)
-    spreadsheet_id = m.group(1) if m else raw
+/* ---------- kategori ---------- */
+.kat{margin:0 20px;display:flex;flex-direction:column}
+.kat-row{
+  display:grid;grid-template-columns:1fr auto;gap:4px 12px;
+  padding:11px 0;border-bottom:1px solid var(--line);align-items:center;
+}
+.kat-row:last-child{border-bottom:none}
+.kat-nama{font-size:14px}
+.kat-nilai{font-family:var(--mono);font-size:13.5px;font-variant-numeric:tabular-nums}
+.kat-bar{grid-column:1/-1;height:4px;background:var(--surface-2);border-radius:99px;overflow:hidden}
+.kat-bar span{display:block;height:100%;background:var(--blue);border-radius:99px;opacity:.7}
+.kat-row:first-child .kat-bar span{opacity:1}
+.kat-pct{font-family:var(--mono);font-size:10.5px;color:var(--faint)}
 
-    if len(spreadsheet_id) < 20 or "/" in spreadsheet_id:
-        await update.message.reply_text(
-            "⚠️ ID spreadsheet sepertinya tidak valid.\n"
-            "Kirim ID-nya saja (bagian setelah `/d/` di URL), "
-            "atau tempel URL lengkapnya.",
-            parse_mode="Markdown",
-        )
-        return
+.kaki{
+  margin:34px 20px 0;padding-top:16px;border-top:1px solid var(--line);
+  font-family:var(--mono);font-size:10.5px;color:var(--faint);line-height:1.7;
+}
 
-    await update.message.reply_text("🔍 Mengecek akses ke spreadsheet...")
+@media (prefers-reduced-motion:no-preference){
+  .hero,.stat,.trx,.kosong,.harian,.kat{animation:naik .5s cubic-bezier(.22,.9,.3,1) backwards}
+  .stat{animation-delay:.06s}
+  .trx,.kosong{animation-delay:.12s}
+  .harian{animation-delay:.18s}
+  .kat{animation-delay:.24s}
+  @keyframes naik{from{opacity:0;transform:translateY(10px)}}
+}
+</style>
 
-    try:
-        ss = get_client().open_by_key(spreadsheet_id)
-        judul = ss.title
-        ws_out = get_or_create_worksheet(ss, SHEET_PENGELUARAN, HEADER_PENGELUARAN)
-        ws_in = get_or_create_worksheet(ss, SHEET_PEMASUKAN, HEADER_PEMASUKAN)
-        rapikan_header(ss, ws_out, len(HEADER_PENGELUARAN),
-                       {"red": 0.15, "green": 0.35, "blue": 0.55})   # biru tua
-        rapikan_header(ss, ws_in, len(HEADER_PEMASUKAN),
-                       {"red": 0.13, "green": 0.42, "blue": 0.31})   # hijau tua
-        ws_dash, _ = setup_dashboard(ss)
-        setup_grafik(ss, ws_dash.id)
-        hapus_sheet_bawaan(ss)
-    except gspread.SpreadsheetNotFound:
-        await update.message.reply_text(
-            "❌ Spreadsheet tidak ditemukan atau saya belum diberi akses.\n\n"
-            "Pastikan sudah kamu *Bagikan* ke email ini sebagai *Editor*:\n"
-            f"`{SERVICE_ACCOUNT_EMAIL}`\n\n"
-            "Lalu coba `/daftar` lagi.",
-            parse_mode="Markdown",
-        )
-        return
-    except Exception as e:
-        logger.error(f"Gagal daftar {user.id}: {e}")
-        await update.message.reply_text(
-            "❌ Gagal menghubungkan spreadsheet. "
-            "Cek ID dan izin aksesnya, lalu coba lagi."
-        )
-        return
+<div class="top">
+  <div class="eyebrow">Pengeluaran</div>
+  <div class="periode" id="periode">—</div>
+</div>
 
-    try:
-        simpan_user(user.id, user.username, spreadsheet_id)
-    except Exception as e:
-        logger.error(f"Gagal simpan user {user.id}: {e}")
-        await update.message.reply_text(
-            "❌ Spreadsheet bisa diakses, tapi pendaftaran gagal disimpan. "
-            "Coba lagi beberapa saat."
-        )
-        return
+<section class="hero">
+  <div class="hero-lbl" id="heroLbl">Hari ini</div>
+  <div class="hero-tgl" id="heroTgl">—</div>
+  <div class="hero-num" id="heroNum">—</div>
+  <div class="banding" id="banding"></div>
+  <div class="hero-pl" id="heroPL"></div>
+</section>
 
-    await update.message.reply_text(
-        f"✅ *Berhasil terhubung!*\n\n"
-        f"📄 Spreadsheet: *{judul}*\n"
-        f"📑 Sheet *{SHEET_PENGELUARAN}*, *{SHEET_PEMASUKAN}*, "
-        f"*{SHEET_DASHBOARD}*, dan *{SHEET_GRAFIK}* sudah siap.\n\n"
-        f"📊 Dashboard akan terisi sendiri begitu ada transaksi.\n\n"
-        f"Coba sekarang:\n`/catat 15000 Makan nasi goreng`",
-        parse_mode="Markdown",
-    )
+<div class="stat">
+  <div class="kartu">
+    <div class="l">Rata-rata harian</div>
+    <div class="v" id="vRata">—</div>
+    <div class="s" id="sRata">—</div>
+  </div>
+  <div class="kartu">
+    <div class="l">Total periode</div>
+    <div class="v" id="vTotal">—</div>
+    <div class="s" id="sTotal">—</div>
+  </div>
+</div>
 
+<div class="rincian-head">
+  <h2 id="rincianJudul">Rincian hari ini</h2>
+  <span class="rule"></span>
+  <select id="pilihHari" aria-label="Pilih hari"></select>
+</div>
+<div id="wadahTrx"></div>
 
-# ==========================================
-# HANDLER: /info
-# ==========================================
-async def info(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    sid = get_spreadsheet_id(update.effective_user.id)
-    if not sid:
-        await update.message.reply_text(pesan_belum_daftar(), parse_mode="Markdown")
-        return
-    try:
-        judul = get_client().open_by_key(sid).title
-    except Exception:
-        judul = "(tidak bisa diakses — cek izin share)"
-    await update.message.reply_text(
-        f"📄 Spreadsheet terhubung: *{judul}*\n"
-        f"🔗 https://docs.google.com/spreadsheets/d/{sid}/edit\n\n"
-        f"Mau ganti spreadsheet? Kirim `/daftar <id_baru>`",
-        parse_mode="Markdown",
-    )
+<h2>Grafik harian</h2>
+<div class="harian">
+  <div class="chart" id="chart"></div>
+  <div class="xlab"><span id="xAwal">—</span><span id="xAkhir">—</span></div>
+  <div class="catatan" id="catatan">—</div>
+</div>
 
+<!-- Disembunyikan sementara: kategori belum valid.
+     Aktifkan lagi dengan menghapus tanda komentar di baris berikut. -->
+<!--
+<h2>Ke mana perginya</h2>
+<div class="kat" id="kat"></div>
+-->
 
-# ==========================================
-# HANDLER: /dummy dan /hapusdummy (untuk uji coba)
-# ==========================================
-def _tanggal_periode(offset_hari):
-    from datetime import timedelta
-    return (datetime.now() - timedelta(days=offset_hari)).strftime("%Y-%m-%d")
+<div class="kaki" id="kaki">—</div>
 
+<script>
+/* ============================================================
+   SUMBER DATA
+   Tempel URL Apps Script kamu di bawah ini.
+   Bentuknya: https://script.google.com/macros/s/AKfyc..../exec
+   Cara membuatnya ada di README dan file apps-script.gs.
+   ============================================================ */
+const URL_DATA = "https://script.google.com/macros/s/AKfycbzjtMJfycmp0vPscid3hxf0KAFzQ7nPG0_hzbP8RH60LmKx_bCC9I5MlAaoHrqeeFhI/exec";
+const HARI_SIKLUS = 25;
 
-DUMMY_PENGELUARAN = [
-    (1, "Makan", 25000, "Warteg Bahari", "Nasi Ayam", "Cash"),
-    (2, "Transport", 12000, "Gojek", "Ke Kantor", "Pay Later"),
-    (3, "Makan", 43500, "BreadTalk", "Roti", "Cash"),
-    (5, "Belanja", 87000, "Indomaret", "Belanja Bulanan", "Cash"),
-    (7, "Makan", 18000, "Fore Coffee", "Kopi", "Pay Later"),
-    (9, "Tagihan", 150000, "PLN", "Listrik", "Cash"),
-    (12, "Transport", 3000, "KRL", "Stasiun Bogor", "Cash"),
-    (16, "Makan", 65000, "Shabu Hachi", "Makan Siang", "Pay Later"),
-    (22, "Belanja", 45000, "Tokopedia", "Aksesoris", "Pay Later"),
-    (28, "Makan", 30000, "Kopi Kenangan", "Nongkrong", "Cash"),
-    (34, "Transport", 8000, "Parkir", "Mall", "Cash"),
-    (40, "Lainnya", 20000, "Barbershop", "Cukur Rambut", "Cash"),
-]
+let pengeluaran = [];
+let totalPaylaterSheet = null;   // diisi dari Rekap Daily (via Apps Script) kalau tersedia
+let hariDipilih = null;          // kunci tanggal yang sedang dilihat di Rincian; null = hari ini
 
-DUMMY_PEMASUKAN = [
-    (2, "💼 Gaji/Tunjangan", 5500000, "Gaji Bulan Ini"),
-    (10, "💸 Freelance", 750000, "Proyek Desain"),
-    (33, "💼 Gaji/Tunjangan", 5500000, "Gaji Bulan Lalu"),
-    (38, "🎁 Bonus/THR", 300000, "Bonus Kinerja"),
-]
+/* ---------- util ---------- */
+const rp  = n => "Rp" + Math.round(n).toLocaleString("id-ID");
+const rpk = n => n >= 1e6 ? "Rp" + (n/1e6).toFixed(n%1e6===0?0:1) + " jt"
+                          : "Rp" + Math.round(n/1000) + "rb";
+const d = s => new Date(s + "T00:00:00");
+const fmt = (t,o) => t.toLocaleDateString("id-ID", o);
+const kunciTgl = t => t.getFullYear() + "-" +
+  String(t.getMonth()+1).padStart(2,"0") + "-" +
+  String(t.getDate()).padStart(2,"0");
 
+function awalPeriode(acuan){
+  const t = new Date(acuan);
+  const m = t.getDate() >= HARI_SIKLUS ? t.getMonth() : t.getMonth()-1;
+  return new Date(t.getFullYear(), m, HARI_SIKLUS);
+}
 
-async def dummy(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    sid = get_spreadsheet_id(user_id)
-    if not sid:
-        await update.message.reply_text(pesan_belum_daftar(), parse_mode="Markdown")
-        return
+function gambar(){
+  if (!pengeluaran.length){
+    document.getElementById("wadahTrx").innerHTML =
+      `<div class="kosong">Belum ada data pengeluaran.<br>
+       Catat lewat bot untuk mulai mengisinya.</div>`;
+    document.getElementById("kaki").textContent = "Tidak ada data";
+    return;
+  }
 
-    await update.message.reply_text("🧪 Membuat data contoh...")
-    try:
-        ss = get_client().open_by_key(sid)
-        ws_out = get_or_create_worksheet(ss, SHEET_PENGELUARAN, HEADER_PENGELUARAN)
-        ws_in = get_or_create_worksheet(ss, SHEET_PEMASUKAN, HEADER_PEMASUKAN)
+  const sekarang = new Date();
+  const hariIni = new Date(sekarang.getFullYear(), sekarang.getMonth(), sekarang.getDate());
+  const kunciHariIni = kunciTgl(hariIni);
 
-        baris_out = [[_tanggal_periode(h), kat, nom, mer, "Dummy", cat, tipe]
-                     for h, kat, nom, mer, cat, tipe in DUMMY_PENGELUARAN]
-        baris_in = [[_tanggal_periode(h), kat, nom, "Dummy", cat]
-                    for h, kat, nom, cat in DUMMY_PEMASUKAN]
+  const mulai   = awalPeriode(hariIni);
+  const selesai = new Date(mulai.getFullYear(), mulai.getMonth()+1, HARI_SIKLUS-1);
+  const totalHari = Math.round((selesai-mulai)/864e5)+1;
+  const hariKe    = Math.max(Math.round((hariIni-mulai)/864e5)+1, 1);
 
-        ws_out.append_rows(baris_out, value_input_option="USER_ENTERED")
-        ws_in.append_rows(baris_in, value_input_option="USER_ENTERED")
+  const periodeIni = pengeluaran.filter(r=>{const t=d(r[0]); return t>=mulai && t<=selesai;});
+  const trxHariIni = periodeIni.filter(r=>r[0]===kunciHariIni);
 
-        await update.message.reply_text(
-            f"✅ *Data contoh dibuat*\n\n"
-            f"📤 {len(baris_out)} pengeluaran\n"
-            f"📥 {len(baris_in)} pemasukan\n"
-            f"Tersebar di periode ini dan periode sebelumnya.\n\n"
-            f"Buka sheet *{SHEET_DASHBOARD}* untuk melihat hasilnya.\n"
-            f"Hapus lagi dengan `/hapusdummy`",
-            parse_mode="Markdown",
-        )
-    except Exception as e:
-        logger.error(f"Gagal buat dummy {user_id}: {e}")
-        await update.message.reply_text("❌ Gagal membuat data contoh.")
+  const totalPeriode = periodeIni.reduce((a,r)=>a+r[2],0);
+  const totalHariIni = trxHariIni.reduce((a,r)=>a+r[2],0);
 
+  /* rata-rata dihitung dari hari yang benar-benar ada transaksinya */
+  const hariAktif = new Set(periodeIni.map(r=>r[0])).size;
+  const rata = hariAktif ? totalPeriode/hariAktif : 0;
 
-def _hapus_baris_dummy(ss, nama_sheet, kolom_sumber, header):
-    """Hapus semua baris yang kolom Sumber-nya bertuliskan 'Dummy'."""
-    ws = get_or_create_worksheet(ss, nama_sheet, header)
-    semua = ws.get_all_values()
-    target = [i for i, r in enumerate(semua)
-              if i > 0 and len(r) > kolom_sumber and r[kolom_sumber] == "Dummy"]
-    if not target:
-        return 0
-    reqs = []
-    for i in sorted(target, reverse=True):  # dari bawah, supaya indeks tidak geser
-        reqs.append({"deleteDimension": {"range": {
-            "sheetId": ws.id, "dimension": "ROWS",
-            "startIndex": i, "endIndex": i + 1}}})
-    ss.batch_update({"requests": reqs})
-    return len(target)
+  /* ---------- header ---------- */
+  document.getElementById("periode").textContent =
+    fmt(mulai,{day:"numeric",month:"short"}) + " – " +
+    fmt(selesai,{day:"numeric",month:"short",year:"numeric"});
 
+  /* ---------- hero ----------
+     Kartu atas sekarang mengikuti hari yang dipilih di dropdown/grafik.
+     Pengisiannya dilakukan oleh renderHero(), dipanggil dari pilihHari(). */
 
-async def hapusdummy(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    sid = get_spreadsheet_id(user_id)
-    if not sid:
-        await update.message.reply_text(pesan_belum_daftar(), parse_mode="Markdown")
-        return
+  /* ---------- total Pay Later (pengingat menahan diri) ----------
+     Utamakan nilai "Total Paylater" dari sheet Rekap Daily (dikirim Apps Script
+     sebagai json.totalPaylater). Kalau field itu belum tersedia, jatuh kembali
+     ke hitungan lama: menjumlah transaksi ber-Tipe Bayar "Pay Later" periode ini. */
+  const totalPayLater = (totalPaylaterSheet != null)
+    ? totalPaylaterSheet
+    : periodeIni.filter(r => r[6] === "Pay Later").reduce((a,r) => a + r[2], 0);
+  const elPL = document.getElementById("heroPL");
+  elPL.className = "hero-pl" + (totalPayLater > 0 ? " ada" : "");
+  elPL.innerHTML =
+    `<span class="pl-lbl">Total Pay Later</span>
+     <span class="pl-val">${rp(totalPayLater)}</span>`;
 
-    await update.message.reply_text("🧹 Menghapus data contoh...")
-    try:
-        ss = get_client().open_by_key(sid)
-        n1 = _hapus_baris_dummy(ss, SHEET_PENGELUARAN, 4, HEADER_PENGELUARAN)
-        n2 = _hapus_baris_dummy(ss, SHEET_PEMASUKAN, 3, HEADER_PEMASUKAN)
-        await update.message.reply_text(
-            f"✅ Data contoh dihapus.\n"
-            f"📤 {n1} pengeluaran, 📥 {n2} pemasukan.\n\n"
-            f"Data asli kamu tidak tersentuh."
-        )
-    except Exception as e:
-        logger.error(f"Gagal hapus dummy {user_id}: {e}")
-        await update.message.reply_text("❌ Gagal menghapus data contoh.")
+  /* ---------- statistik ---------- */
+  document.getElementById("vRata").textContent = rp(rata);
+  document.getElementById("sRata").textContent = `dari ${hariAktif} hari ada transaksi`;
+  document.getElementById("vTotal").textContent = rpk(totalPeriode);
+  document.getElementById("sTotal").textContent = `hari ke-${hariKe} dari ${totalHari}`;
 
+  /* ---------- rincian per hari + grafik interaktif ----------
+     Pilih hari lewat dropdown ATAU ketuk batang grafik — keduanya menampilkan
+     total pengeluaran + rincian transaksi hari itu. Transaksi diurutkan dari
+     yang terakhir dicatat ke paling lama; tampil 5 teratas, sisanya lewat tombol. */
+  const BATAS = 5;
 
-# ==========================================
-# HANDLER: /catat
-# ==========================================
-async def catat_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not get_spreadsheet_id(user_id):
-        await update.message.reply_text(pesan_belum_daftar(), parse_mode="Markdown")
-        return
+  // kumpulkan transaksi & total per hari (dalam periode)
+  const trxPerHari = new Map();
+  const perHari = new Map();
+  periodeIni.forEach(r=>{
+    if(!trxPerHari.has(r[0])) trxPerHari.set(r[0], []);
+    trxPerHari.get(r[0]).push(r);
+    perHari.set(r[0], (perHari.get(r[0])||0) + r[2]);
+  });
 
-    args = context.args
-    if len(args) < 2:
-        await update.message.reply_text(
-            "⚠️ Format salah.\n\n"
-            "Contoh: `/catat 50000 Makan nasi goreng`\n"
-            "Format: /catat [nominal] [kategori] [catatan opsional]",
-            parse_mode="Markdown",
-        )
-        return
+  const buatBaris = r => {
+    const [,kat,nom,merchant,sumber,catatan,tipe] = r;
+    const judul = merchant && merchant !== "-" ? merchant : kat;
+    const bagian = [kat];
+    if (catatan) bagian.push(catatan);
+    if (tipe === "Pay Later") bagian.push("Pay Later");
+    const row = document.createElement("div");
+    row.className = "trx-row";
+    row.innerHTML = `
+      <span class="tanda">${kat.slice(0,2).toUpperCase()}</span>
+      <span>
+        <div class="trx-nama">${judul}</div>
+        <div class="trx-meta">${bagian.join(" · ")}</div>
+      </span>
+      <span class="trx-nilai">${rp(nom)}</span>`;
+    return row;
+  };
 
-    try:
-        nominal = int(args[0].replace(".", "").replace(",", ""))
-    except ValueError:
-        await update.message.reply_text("⚠️ Nominal harus angka. Contoh: /catat 50000 Makan")
-        return
+  function renderRincian(kunci){
+    const wadah = document.getElementById("wadahTrx");
+    wadah.innerHTML = "";
+    document.getElementById("rincianJudul").textContent =
+      (kunci === kunciHariIni)
+        ? "Rincian hari ini"
+        : "Rincian " + fmt(d(kunci),{weekday:"long",day:"numeric",month:"long"});
 
-    data = {
-        "user_id": user_id,
-        "jenis": "pengeluaran",
-        "tanggal": datetime.now().strftime("%Y-%m-%d"),
-        "kategori": args[1].title(),
-        "nominal": nominal,
-        "merchant": "-",
-        "sumber": "Manual",
-        "catatan": " ".join(args[2:]).title() if len(args) > 2 else "",
+    const trx = trxPerHari.get(kunci) || [];
+    if (!trx.length){
+      wadah.innerHTML = (kunci === kunciHariIni)
+        ? `<div class="kosong">Belum ada catatan hari ini.<br>
+             Kirim struk atau <b>/catat</b> lewat bot untuk mengisinya.</div>`
+        : `<div class="kosong">Tidak ada transaksi pada hari ini.</div>`;
+      return;
     }
-    token = buat_token(data)
-
-    await update.message.reply_text(
-        f"📋 *Detail Pengeluaran:*\n\n"
-        f"📅 Tanggal: {data['tanggal']}\n"
-        f"🏷️ Kategori: {data['kategori']}\n"
-        f"💰 Nominal: Rp{nominal:,}\n"
-        f"📝 Catatan: {data['catatan'] or '-'}\n\n"
-        f"Pilih tipe pembayaran:",
-        parse_mode="Markdown",
-        reply_markup=keyboard_tipe_bayar(token),
-    )
-
-
-# ==========================================
-# HANDLER: /masuk
-# ==========================================
-async def catat_masuk(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not get_spreadsheet_id(user_id):
-        await update.message.reply_text(pesan_belum_daftar(), parse_mode="Markdown")
-        return
-
-    args = context.args
-    if len(args) < 1:
-        await update.message.reply_text(
-            "⚠️ Format salah.\n\n"
-            "Contoh: `/masuk 5000000 Gaji bulan ini`\n"
-            "Format: /masuk [nominal] [catatan opsional]",
-            parse_mode="Markdown",
-        )
-        return
-
-    try:
-        nominal = int(args[0].replace(".", "").replace(",", ""))
-    except ValueError:
-        await update.message.reply_text("⚠️ Nominal harus angka. Contoh: /masuk 5000000")
-        return
-
-    data = {
-        "user_id": user_id,
-        "jenis": "pemasukan",
-        "tanggal": datetime.now().strftime("%Y-%m-%d"),
-        "nominal": nominal,
-        "catatan": " ".join(args[1:]).title() if len(args) > 1 else "",
+    const urut = trx.slice().reverse();   // terbaru di atas
+    const list = document.createElement("div");
+    list.className = "trx";
+    urut.forEach((r,i)=>{
+      const row = buatBaris(r);
+      if (i >= BATAS) row.classList.add("sisa");
+      list.appendChild(row);
+    });
+    if (urut.length > BATAS){
+      const sisa = urut.length - BATAS;
+      const tombol = document.createElement("button");
+      tombol.className = "trx-toggle";
+      tombol.setAttribute("aria-expanded","false");
+      const labelTutup = `Lihat semua ${urut.length} transaksi (${sisa} lagi) ▾`;
+      const labelBuka  = `Tampilkan lebih sedikit ▴`;
+      tombol.textContent = labelTutup;
+      tombol.addEventListener("click", ()=>{
+        const buka = list.classList.toggle("trx-buka");
+        tombol.textContent = buka ? labelBuka : labelTutup;
+        tombol.setAttribute("aria-expanded", buka ? "true" : "false");
+      });
+      list.appendChild(tombol);
     }
-    token = buat_token(data)
+    wadah.appendChild(list);
+  }
 
-    await update.message.reply_text(
-        f"📋 *Detail Pemasukan:*\n\n"
-        f"📅 Tanggal: {data['tanggal']}\n"
-        f"💰 Nominal: Rp{nominal:,}\n"
-        f"📝 Catatan: {data['catatan'] or '-'}\n\n"
-        f"Pilih kategori pemasukan:",
-        parse_mode="Markdown",
-        reply_markup=keyboard_kategori_pemasukan(token),
-    )
+  /* ---------- grafik harian (interaktif) ---------- */
+  const deret=[];
+  for(let i=0;i<hariKe;i++){
+    const t=new Date(mulai.getFullYear(),mulai.getMonth(),mulai.getDate()+i);
+    const k=kunciTgl(t);
+    deret.push({tgl:t,k:k,nilai:perHari.get(k)||0,kini:k===kunciHariIni});
+  }
+  const puncak = Math.max(...deret.map(x=>x.nilai),1);
+  const chart = document.getElementById("chart");
+  chart.innerHTML = "";
 
+  const tip = document.createElement("div");
+  tip.className = "chart-tip";
+  tip.innerHTML = `<span class="tip-tgl"></span><span class="tip-val"></span>`;
+  chart.appendChild(tip);
 
-# ==========================================
-# HANDLER: foto struk
-# ==========================================
-async def terima_foto(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not get_spreadsheet_id(user_id):
-        await update.message.reply_text(pesan_belum_daftar(), parse_mode="Markdown")
-        return
+  const kolomByKunci = new Map();
+  deret.forEach((x,i)=>{
+    const col=document.createElement("div");
+    col.className="col" + (x.kini?" kini":(x.nilai===puncak?" hi":""));
+    const bar=document.createElement("i");
+    bar.style.height="0%";
+    bar.style.transition="height .55s cubic-bezier(.22,.9,.3,1) "+(i*26)+"ms";
+    col.appendChild(bar);
+    col.addEventListener("click", ()=>{ hariDipilih = x.k; pilihHari(x.k, true); });
+    chart.appendChild(col);
+    kolomByKunci.set(x.k, col);
+    requestAnimationFrame(()=>bar.style.height=Math.max(x.nilai/puncak*100,1.5)+"%");
+  });
 
-    await update.message.reply_text("📸 Struk diterima, sedang dibaca...")
-    hari_ini = datetime.now().strftime("%Y-%m-%d")
+  function tampilkanTip(kunci){
+    const info = deret.find(x=>x.k===kunci);
+    const col = kolomByKunci.get(kunci);
+    if (!info || !col){ tip.classList.remove("tampil"); return; }
+    const total = perHari.get(kunci) || 0;
+    tip.querySelector(".tip-tgl").textContent = fmt(info.tgl,{day:"numeric",month:"short"});
+    tip.querySelector(".tip-val").textContent = rp(total);
+    tip.classList.add("tampil");
+    requestAnimationFrame(()=>{
+      const H = chart.clientHeight;
+      const barPx = Math.max(total/puncak, 0.015) * H;
+      const th = tip.offsetHeight;
+      let bottom = barPx + 8;
+      if (bottom + th > H - 2) bottom = H - th - 2;   // jangan keluar dari atas grafik
+      tip.style.bottom = bottom + "px";
+      const center = col.offsetLeft + col.offsetWidth/2;
+      const half = tip.offsetWidth/2;
+      tip.style.left = Math.min(Math.max(center, half), chart.clientWidth - half) + "px";
+    });
+  }
 
-    try:
-        photo_file = await update.message.photo[-1].get_file()
-        photo_bytes = await photo_file.download_as_bytearray()
+  const sel = document.getElementById("pilihHari");
 
-        prompt = f"""
-        Kamu adalah asisten yang membaca struk belanja/pembayaran.
-        Hari ini adalah {hari_ini}. Gunakan ini sebagai acuan tahun,
-        JANGAN menebak tahun lain kecuali struk mencantumkan tahun dengan jelas.
+  /* Isi kartu atas (tanggal, total besar, banding) untuk satu hari.
+     Total Pay Later TIDAK diubah di sini — itu angka seluruh periode, bukan per hari. */
+  function renderHero(kunci){
+    const totalHari = perHari.get(kunci) || 0;
+    const iniHariIni = (kunci === kunciHariIni);
 
-        Baca gambar struk ini dan balas dengan JSON saja, tanpa teks lain,
-        tanpa markdown backticks:
+    document.getElementById("heroLbl").textContent = iniHariIni ? "Hari ini" : "Hari dipilih";
+    document.getElementById("heroTgl").textContent =
+      fmt(d(kunci),{weekday:"long",day:"numeric",month:"long",year:"numeric"});
+    document.getElementById("heroNum").textContent = rp(totalHari);
 
-        {{
-            "merchant": "nama toko/tempat",
-            "tanggal": "YYYY-MM-DD (kalau tidak jelas gunakan {hari_ini})",
-            "nominal": angka_total_tanpa_titik_atau_koma,
-            "kategori": "Makan / Transport / Belanja / Tagihan / Lainnya"
-        }}
+    const selisih = totalHari - rata;
+    const pct = rata ? Math.abs(selisih/rata*100) : 0;
+    document.getElementById("banding").innerHTML = totalHari === 0
+      ? (iniHariIni ? `Belum ada pengeluaran hari ini.`
+                    : `Tidak ada pengeluaran di tanggal ini.`)
+      : `<span class="pil ${selisih>0?"atas":"bawah"}">
+           ${selisih>0?"▲":"▼"} ${pct.toFixed(0)}%
+         </span>
+         <span>${selisih>0?"di atas":"di bawah"} rata-rata harianmu</span>`;
+  }
 
-        Ambil TOTAL akhir yang dibayar.
-        Jika gambar berisi LEBIH DARI SATU struk, isi nominal dengan -1.
-        Jika gambar tidak jelas atau bukan struk, isi nominal dengan 0.
-        """
-
-        response = gemini_model.generate_content(
-            [prompt, {"mime_type": "image/jpeg", "data": bytes(photo_bytes)}]
-        )
-        teks = re.sub(r"^```json\s*|\s*```$", "", response.text.strip()).strip()
-        hasil = json.loads(teks)
-        nominal = hasil.get("nominal", 0)
-
-        if nominal == -1:
-            await update.message.reply_text(
-                "⚠️ Sepertinya ada beberapa struk dalam satu gambar.\n"
-                "Kirim satu foto untuk satu struk ya, supaya nominalnya akurat."
-            )
-            return
-
-        if not nominal or nominal == 0:
-            await update.message.reply_text(
-                "⚠️ Struk tidak terbaca jelas.\n"
-                "Coba foto ulang lebih dekat, atau catat manual:\n"
-                "`/catat 50000 Makan catatan`",
-                parse_mode="Markdown",
-            )
-            return
-
-        data = {
-            "user_id": user_id,
-            "jenis": "pengeluaran",
-            "tanggal": hasil.get("tanggal") or hari_ini,
-            "kategori": hasil.get("kategori", "Lainnya"),
-            "nominal": nominal,
-            "merchant": hasil.get("merchant", "-"),
-            "sumber": "Struk",
-            "catatan": "",
-        }
-        token = buat_token(data)
-
-        await update.message.reply_text(
-            f"📋 *Hasil baca struk:*\n\n"
-            f"🏪 Merchant: {data['merchant']}\n"
-            f"📅 Tanggal: {data['tanggal']}\n"
-            f"🏷️ Kategori: {data['kategori']}\n"
-            f"💰 Nominal: Rp{nominal:,}\n\n"
-            f"Simpan data ini?",
-            parse_mode="Markdown",
-            reply_markup=keyboard_konfirmasi_struk(token),
-        )
-
-    except Exception as e:
-        logger.error(f"Gagal proses struk: {e}")
-        await update.message.reply_text(
-            "❌ Gagal membaca struk. Coba lagi atau catat manual dengan /catat"
-        )
-
-
-# ==========================================
-# HANDLER: tombol
-# ==========================================
-async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    raw = query.data or ""
-    aksi, _, token = raw.partition("|")
-    data = pending.get(token)
-
-    if not data:
-        await query.edit_message_text(
-            "⚠️ Data ini sudah kedaluwarsa (bot mungkin baru restart). "
-            "Coba input ulang ya."
-        )
-        return
-
-    # Pastikan yang menekan tombol adalah pemilik data
-    if data.get("user_id") != query.from_user.id:
-        return
-
-    user_id = data["user_id"]
-
-    # --- Batal ---
-    if aksi == "struk_batal":
-        pending.pop(token, None)
-        await query.edit_message_text("❌ Dibatalkan, data tidak disimpan.")
-        return
-
-    # --- Konfirmasi struk, lanjut pilih tipe bayar ---
-    if aksi == "struk_simpan":
-        await query.edit_message_text(
-            f"📋 *Detail Pengeluaran:*\n\n"
-            f"🏪 Merchant: {data['merchant']}\n"
-            f"📅 Tanggal: {data['tanggal']}\n"
-            f"🏷️ Kategori: {data['kategori']}\n"
-            f"💰 Nominal: Rp{data['nominal']:,}\n\n"
-            f"Pilih tipe pembayaran:",
-            parse_mode="Markdown",
-            reply_markup=keyboard_tipe_bayar(token),
-        )
-        return
-
-    # --- Tipe pembayaran ---
-    if aksi in ("bayar_cash", "bayar_paylater"):
-        tipe = "Cash" if aksi == "bayar_cash" else "Pay Later"
-        ikon = "💵" if aksi == "bayar_cash" else "💳"
-        try:
-            simpan_pengeluaran(
-                user_id=user_id,
-                tanggal=data["tanggal"],
-                kategori=data["kategori"],
-                nominal=data["nominal"],
-                merchant=data.get("merchant", "-"),
-                sumber=data.get("sumber", "Manual"),
-                catatan=data.get("catatan", ""),
-                tipe_bayar=tipe,
-            )
-            pending.pop(token, None)
-            await query.edit_message_text(
-                f"✅ *Pengeluaran tersimpan!*\n\n"
-                f"📅 {data['tanggal']}\n"
-                f"🏷️ {data['kategori']}\n"
-                f"💰 Rp{data['nominal']:,}\n"
-                f"{ikon} Tipe: *{tipe}*",
-                parse_mode="Markdown",
-            )
-        except Exception as e:
-            logger.error(f"Gagal simpan pengeluaran {user_id}: {e}")
-            await query.edit_message_text(
-                "❌ Gagal menyimpan ke spreadsheet. "
-                "Cek apakah akses Editor masih aktif, lalu coba lagi."
-            )
-        return
-
-    # --- Kategori pemasukan ---
-    if aksi.startswith("masuk_"):
-        kode = aksi.replace("masuk_", "")
-        kategori = KATEGORI_MASUK.get(kode, "📦 Lainnya")
-        try:
-            simpan_pemasukan(
-                user_id=user_id,
-                tanggal=data["tanggal"],
-                kategori=kategori,
-                nominal=data["nominal"],
-                sumber="Manual",
-                catatan=data.get("catatan", ""),
-            )
-            pending.pop(token, None)
-            await query.edit_message_text(
-                f"✅ *Pemasukan tersimpan!*\n\n"
-                f"📅 {data['tanggal']}\n"
-                f"{kategori}\n"
-                f"💰 Rp{data['nominal']:,}\n"
-                f"📝 {data.get('catatan') or '-'}",
-                parse_mode="Markdown",
-            )
-        except Exception as e:
-            logger.error(f"Gagal simpan pemasukan {user_id}: {e}")
-            await query.edit_message_text(
-                "❌ Gagal menyimpan ke spreadsheet. "
-                "Cek akses Editor, lalu coba lagi."
-            )
-        return
-
-
-# ==========================================
-# ERROR HANDLER
-# ==========================================
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logger.error(f"!!! ERROR: {context.error}", exc_info=context.error)
-
-
-# ==========================================
-# MAIN
-# ==========================================
-def cek_konfigurasi():
-    """Pastikan semua environment variable wajib sudah diisi."""
-    wajib = {
-        "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN,
-        "GEMINI_API_KEY": GEMINI_API_KEY,
-        "MASTER_SPREADSHEET_ID": MASTER_SPREADSHEET_ID,
-        "GOOGLE_CREDENTIALS_JSON": GOOGLE_CREDENTIALS_JSON,
+  function pilihHari(kunci, withTip){
+    if (sel.value !== kunci) sel.value = kunci;
+    renderHero(kunci);
+    renderRincian(kunci);
+    chart.querySelectorAll(".col.pilih").forEach(c=>c.classList.remove("pilih"));
+    if (withTip){
+      const col = kolomByKunci.get(kunci);
+      if (col) col.classList.add("pilih");
+      tampilkanTip(kunci);
+    } else {
+      tip.classList.remove("tampil");
     }
-    kurang = [k for k, v in wajib.items() if not v]
-    if kurang:
-        print("\n[!] Environment variable belum diisi: " + ", ".join(kurang))
-        print("    Isi dulu di Railway/VPS, lalu jalankan lagi.\n")
-        raise SystemExit(1)
+  }
 
+  // isi dropdown: semua hari dari awal periode s/d hari ini (terbaru dulu),
+  // supaya setiap batang grafik punya opsi dropdown yang cocok persis.
+  const daftarHari = deret.map(x=>x.k).slice().reverse();
+  if (hariDipilih == null || !daftarHari.includes(hariDipilih)) hariDipilih = kunciHariIni;
+  sel.innerHTML = "";
+  daftarHari.forEach(k=>{
+    const opt = document.createElement("option");
+    opt.value = k;
+    opt.textContent = (k===kunciHariIni ? "Hari ini · " : "") +
+      fmt(d(k),{weekday:"short",day:"numeric",month:"short"});
+    if (k===hariDipilih) opt.selected = true;
+    sel.appendChild(opt);
+  });
+  sel.onchange = () => { hariDipilih = sel.value; pilihHari(hariDipilih, true); };
 
-def main():
-    cek_konfigurasi()
-    load_user_map(force=True)
-    logger.info(f"Jumlah user terdaftar: {len(_user_map or {})}")
-    logger.info(f"Service account: {SERVICE_ACCOUNT_EMAIL}")
+  // tampilkan hari terpilih. Default hari ini = tanpa tooltip (tampilan bersih);
+  // kalau sebelumnya sedang melihat hari lain, pertahankan sorotan + tooltip.
+  pilihHari(hariDipilih, hariDipilih !== kunciHariIni);
 
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("daftar", daftar))
-    app.add_handler(CommandHandler("info", info))
-    app.add_handler(CommandHandler("catat", catat_manual))
-    app.add_handler(CommandHandler("masuk", catat_masuk))
-    app.add_handler(CommandHandler("dummy", dummy))
-    app.add_handler(CommandHandler("hapusdummy", hapusdummy))
-    app.add_handler(MessageHandler(filters.PHOTO, terima_foto))
-    app.add_handler(CallbackQueryHandler(callback_handler))
-    app.add_error_handler(error_handler)
+  document.getElementById("xAwal").textContent  = fmt(mulai,{day:"numeric",month:"short"});
+  document.getElementById("xAkhir").textContent = fmt(hariIni,{day:"numeric",month:"short"});
 
-    print("🤖 Bot multi-user sedang berjalan... Tekan CTRL+C untuk berhenti.")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+  const terboros = deret.find(x=>x.nilai===puncak);
+  document.getElementById("catatan").innerHTML =
+    `Ketuk batang untuk lihat total &amp; rincian hari itu. Paling boros
+     <b>${fmt(terboros.tgl,{weekday:"long",day:"numeric",month:"long"})}</b> — ${rp(puncak)}.`;
 
+  /* ---------- kategori (disembunyikan sementara — kategori belum valid) ----------
+     Blok ini otomatis dilewati selama elemen #kat masih di-comment di HTML.
+     Begitu HTML-nya diaktifkan lagi, bagian ini langsung jalan tanpa perubahan. */
+  const elKat=document.getElementById("kat");
+  if (elKat){
+    elKat.innerHTML = "";   // kosongkan dulu supaya tidak dobel saat disegarkan ulang
+    const perKat=new Map();
+    periodeIni.forEach(r=>perKat.set(r[1],(perKat.get(r[1])||0)+r[2]));
+    [...perKat.entries()].sort((a,b)=>b[1]-a[1]).forEach(([nama,nilai],i)=>{
+      const p=nilai/totalPeriode*100;
+      const row=document.createElement("div");
+      row.className="kat-row";
+      row.innerHTML=`
+        <span class="kat-nama">${nama}</span>
+        <span class="kat-nilai">${rp(nilai)}</span>
+        <span class="kat-bar"><span style="width:0"></span></span>
+        <span class="kat-pct">${p.toFixed(0)}%</span>`;
+      elKat.appendChild(row);
+      const isi=row.querySelector(".kat-bar span");
+      isi.style.transition="width .7s cubic-bezier(.22,.9,.3,1) "+(i*70+150)+"ms";
+      requestAnimationFrame(()=>isi.style.width=p+"%");
+    });
+  }
 
-if __name__ == "__main__":
-    main()
+  /* ---------- kaki ---------- */
+  document.getElementById("kaki").innerHTML =
+    `${trxHariIni.length} transaksi hari ini · ${periodeIni.length} periode ini<br>
+     Siklus tanggal ${HARI_SIKLUS} ke ${HARI_SIKLUS-1} ·
+     <span id="segar">memuat…</span>`;
+
+}
+
+/* ---------- ambil data ---------- */
+function tampilkanGagal(pesan){
+  document.getElementById("heroNum").textContent = "—";
+  document.getElementById("wadahTrx").innerHTML =
+    `<div class="kosong">${pesan}</div>`;
+  document.getElementById("kaki").textContent = "Gagal memuat";
+}
+
+/* Data diambil lewat JSONP, bukan fetch.
+   Alasannya: browser memblokir fetch dari file:// ke internet,
+   sedangkan <script> tidak kena batasan itu. Jadi cara ini tetap
+   jalan baik file dibuka langsung dari komputer maupun dari web. */
+let sedangMuat = false;
+
+function muat(){
+  if (URL_DATA.indexOf("script.google.com") === -1){
+    tampilkanGagal("URL Apps Script belum diisi.<br>" +
+      "Buka <b>index.html</b>, cari <b>URL_DATA</b> di bagian atas script, " +
+      "lalu tempel URL milikmu.");
+    return;
+  }
+  if (sedangMuat) return;
+  sedangMuat = true;
+
+  const nama = "terimaData" + Date.now();
+  const s = document.createElement("script");
+  const batas = setTimeout(() => {
+    gagal("Server tidak menjawab.<br>Coba muat ulang halaman.");
+  }, 20000);
+
+  function bersihkan(){
+    clearTimeout(batas);
+    delete window[nama];
+    if (s.parentNode) s.parentNode.removeChild(s);
+    sedangMuat = false;
+  }
+  function gagal(pesan){
+    bersihkan();
+    tampilkanGagal(pesan);
+  }
+
+  window[nama] = (json) => {
+    bersihkan();
+    pengeluaran = (json && json.pengeluaran) || [];
+    totalPaylaterSheet = (json && json.totalPaylater != null && !isNaN(Number(json.totalPaylater)))
+      ? Number(json.totalPaylater) : null;
+    gambar();
+    const el = document.getElementById("segar");
+    if (el) el.textContent = "Diperbarui " +
+      new Date().toLocaleTimeString("id-ID", {hour:"2-digit", minute:"2-digit"});
+  };
+
+  s.src = URL_DATA + "?callback=" + nama + "&_=" + Date.now();
+  s.onerror = () => gagal("Tidak bisa menghubungi server.<br>Cek koneksi internet, lalu muat ulang halaman.");
+  document.body.appendChild(s);
+}
+
+muat();
+/* Setiap dashboard dibuka/kembali ke depan: segarkan data & kembali ke Hari Ini.
+   Selama masih dibuka, pilihan hari tetap (tidak tersentak balik). */
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden){
+    hariDipilih = null;   // kembali ke hari ini saat dashboard dibuka lagi
+    muat();
+  }
+});
+</script>
