@@ -893,6 +893,32 @@ async def hapusdummy(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==========================================
 # HANDLER: /catat
 # ==========================================
+def tanggal_dari_kata(tokens):
+    """Deteksi kata waktu di antara tokens dan buang katanya.
+    Kembalikan (tanggal 'YYYY-MM-DD', tokens_bersih).
+      'kemarin'       -> mundur 1 hari
+      'kemarin lusa'  -> mundur 2 hari
+    Kalau tidak ada, tanggalnya hari ini."""
+    from datetime import timedelta
+    offset = 0
+    bersih = []
+    low = [t.lower() for t in tokens]
+    i = 0
+    while i < len(tokens):
+        if low[i] == "kemarin":
+            if i + 1 < len(tokens) and low[i + 1] == "lusa":
+                offset = 2
+                i += 2
+                continue
+            offset = 1
+            i += 1
+            continue
+        bersih.append(tokens[i])
+        i += 1
+    tgl = (datetime.now() - timedelta(days=offset)).strftime("%Y-%m-%d")
+    return tgl, bersih
+
+
 async def catat_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not get_spreadsheet_id(user_id):
@@ -915,15 +941,25 @@ async def catat_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Nominal harus angka. Contoh: /catat 50000 Makan")
         return
 
+    tanggal, sisa = tanggal_dari_kata(args[1:])
+    if not sisa:
+        await update.message.reply_text(
+            "⚠️ Kategori belum ada.\n\n"
+            "Contoh: `/catat 50000 Makan nasi goreng`\n"
+            "Atau tanggal kemarin: `/catat 50000 Makan warteg kemarin`",
+            parse_mode="Markdown",
+        )
+        return
+
     data = {
         "user_id": user_id,
         "jenis": "pengeluaran",
-        "tanggal": datetime.now().strftime("%Y-%m-%d"),
-        "kategori": args[1].title(),
+        "tanggal": tanggal,
+        "kategori": sisa[0].title(),
         "nominal": nominal,
         "merchant": "-",
         "sumber": "Manual",
-        "catatan": " ".join(args[2:]).title() if len(args) > 2 else "",
+        "catatan": " ".join(sisa[1:]).title() if len(sisa) > 1 else "",
     }
     token = buat_token(data)
 
@@ -964,12 +1000,14 @@ async def catat_masuk(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Nominal harus angka. Contoh: /masuk 5000000")
         return
 
+    tanggal, sisa = tanggal_dari_kata(args[1:])
+
     data = {
         "user_id": user_id,
         "jenis": "pemasukan",
-        "tanggal": datetime.now().strftime("%Y-%m-%d"),
+        "tanggal": tanggal,
         "nominal": nominal,
-        "catatan": " ".join(args[1:]).title() if len(args) > 1 else "",
+        "catatan": " ".join(sisa).title() if sisa else "",
     }
     token = buat_token(data)
 
