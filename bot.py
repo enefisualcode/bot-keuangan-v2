@@ -641,7 +641,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👋 Halo! Saya bot pencatat keuangan kamu.\n\n"
         "📝 *Cara pakai:*\n\n"
         "1️⃣ *Pengeluaran manual*\n"
-        "`/catat 50000 Makan nasi goreng kantor`\n\n"
+        "`/catat 50000 Makan nasi goreng kantor`\n"
+        "_Tambah note pribadi pakai `;`_ →\n"
+        "`/catat 50000 Makan siang tim ; ditalangin, ditagih ke Andi`\n\n"
         "2️⃣ *Pemasukan*\n"
         "`/masuk 5000000 Gaji bulan ini`\n\n"
         "3️⃣ *Dari struk*\n"
@@ -941,15 +943,24 @@ async def catat_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Nominal harus angka. Contoh: /catat 50000 Makan")
         return
 
-    tanggal, sisa = tanggal_dari_kata(args[1:])
+    # Pisahkan note pribadi (setelah ';') dari kategori + deskripsi.
+    kiri, _, note = " ".join(args[1:]).partition(";")
+    note = note.strip()
+
+    # Deteksi 'kemarin' hanya di bagian kiri, bukan di dalam note.
+    tanggal, sisa = tanggal_dari_kata(kiri.split())
     if not sisa:
         await update.message.reply_text(
             "⚠️ Kategori belum ada.\n\n"
             "Contoh: `/catat 50000 Makan nasi goreng`\n"
-            "Atau tanggal kemarin: `/catat 50000 Makan warteg kemarin`",
+            "Tanggal kemarin: `/catat 50000 Makan warteg kemarin`\n"
+            "Dengan note: `/catat 50000 Makan siang tim ; ditalangin, ditagih ke Andi`",
             parse_mode="Markdown",
         )
         return
+
+    deskripsi = " ".join(sisa[1:]).strip()          # verbatim, tanpa Title Case
+    catatan = " — ".join(p for p in (deskripsi, note) if p)
 
     data = {
         "user_id": user_id,
@@ -959,7 +970,7 @@ async def catat_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "nominal": nominal,
         "merchant": "-",
         "sumber": "Manual",
-        "catatan": " ".join(sisa[1:]).title() if len(sisa) > 1 else "",
+        "catatan": catatan,
     }
     token = buat_token(data)
 
@@ -1000,14 +1011,18 @@ async def catat_masuk(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Nominal harus angka. Contoh: /masuk 5000000")
         return
 
-    tanggal, sisa = tanggal_dari_kata(args[1:])
+    kiri, _, note = " ".join(args[1:]).partition(";")
+    note = note.strip()
+    tanggal, sisa = tanggal_dari_kata(kiri.split())
+    deskripsi = " ".join(sisa).strip()              # verbatim, tanpa Title Case
+    catatan = " — ".join(p for p in (deskripsi, note) if p)
 
     data = {
         "user_id": user_id,
         "jenis": "pemasukan",
         "tanggal": tanggal,
         "nominal": nominal,
-        "catatan": " ".join(sisa).title() if sisa else "",
+        "catatan": catatan,
     }
     token = buat_token(data)
 
