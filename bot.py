@@ -617,17 +617,15 @@ def pesan_belum_daftar():
         "🔐 *Kamu belum menghubungkan spreadsheet.*\n\n"
         "Bot ini menulis ke Google Spreadsheet milikmu sendiri, "
         "jadi datamu tidak tercampur dengan pengguna lain.\n\n"
-        "*Cara menghubungkan (5 menit):*\n\n"
+        "*Cara menghubungkan (3 langkah):*\n\n"
         "1️⃣ Buka Google Sheets, buat spreadsheet baru (boleh kosong).\n\n"
         "2️⃣ Klik *Bagikan*, masukkan email ini sebagai *Editor*:\n"
         f"`{SERVICE_ACCOUNT_EMAIL}`\n\n"
-        "3️⃣ Copy *ID spreadsheet* dari URL. Contoh URL:\n"
-        "`docs.google.com/spreadsheets/d/`*`1AbCdEfGh123`*`/edit`\n"
-        "yang dicetak tebal itu ID-nya.\n\n"
-        "4️⃣ Kirim ke saya:\n"
-        "`/daftar 1AbCdEfGh123`\n\n"
-        "Kolom, sheet, dan dashboard akan saya buat otomatis.\n"
-        "_Sheet1 bawaan boleh kamu hapus setelah terhubung._"
+        "3️⃣ Salin *link* spreadsheet-nya "
+        "(dari address bar, atau tombol *Bagikan → Salin link*), "
+        "lalu *tempel di sini* dan kirim.\n\n"
+        "Selesai — kolom, sheet, dan dashboard saya buat otomatis.\n"
+        "_Tidak perlu ketik perintah apa pun; cukup tempel link-nya._"
     )
 
 
@@ -656,30 +654,22 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ==========================================
-# HANDLER: /daftar
+# INTI PENDAFTARAN (dipakai /daftar & deteksi link otomatis)
 # ==========================================
-async def daftar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    args = context.args
+def ekstrak_id_spreadsheet(teks):
+    """Ambil ID dari URL /d/<id>, atau dari ID mentah. None kalau tak valid."""
+    if not teks:
+        return None
+    teks = teks.strip()
+    m = re.search(r"/d/([a-zA-Z0-9\-_]{20,})", teks)
+    if m:
+        return m.group(1)
+    if re.fullmatch(r"[a-zA-Z0-9\-_]{20,}", teks):
+        return teks
+    return None
 
-    if not args:
-        await update.message.reply_text(pesan_belum_daftar(), parse_mode="Markdown")
-        return
 
-    raw = args[0].strip()
-    # Terima ID mentah maupun URL lengkap
-    m = re.search(r"/d/([a-zA-Z0-9-_]{20,})", raw)
-    spreadsheet_id = m.group(1) if m else raw
-
-    if len(spreadsheet_id) < 20 or "/" in spreadsheet_id:
-        await update.message.reply_text(
-            "⚠️ ID spreadsheet sepertinya tidak valid.\n"
-            "Kirim ID-nya saja (bagian setelah `/d/` di URL), "
-            "atau tempel URL lengkapnya.",
-            parse_mode="Markdown",
-        )
-        return
-
+async def _proses_daftar(update, spreadsheet_id, user):
     await update.message.reply_text("🔍 Mengecek akses ke spreadsheet...")
 
     try:
@@ -699,7 +689,7 @@ async def daftar(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "❌ Spreadsheet tidak ditemukan atau saya belum diberi akses.\n\n"
             "Pastikan sudah kamu *Bagikan* ke email ini sebagai *Editor*:\n"
             f"`{SERVICE_ACCOUNT_EMAIL}`\n\n"
-            "Lalu coba `/daftar` lagi.",
+            "Lalu tempel lagi link-nya.",
             parse_mode="Markdown",
         )
         return
@@ -707,7 +697,7 @@ async def daftar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Gagal daftar {user.id}: {e}")
         await update.message.reply_text(
             "❌ Gagal menghubungkan spreadsheet. "
-            "Cek ID dan izin aksesnya, lalu coba lagi."
+            "Cek link dan izin aksesnya, lalu coba lagi."
         )
         return
 
@@ -733,6 +723,49 @@ async def daftar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ==========================================
+# HANDLER: /daftar
+# ==========================================
+async def daftar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    args = context.args
+
+    if not args:
+        await update.message.reply_text(pesan_belum_daftar(), parse_mode="Markdown")
+        return
+
+    sid = ekstrak_id_spreadsheet(" ".join(args))
+    if not sid:
+        await update.message.reply_text(
+            "⚠️ Link atau ID-nya sepertinya tidak valid.\n"
+            "Tempel *link lengkap* spreadsheet-nya, contoh:\n"
+            "`https://docs.google.com/spreadsheets/d/.../edit`",
+            parse_mode="Markdown",
+        )
+        return
+
+    await _proses_daftar(update, sid, user)
+
+
+# ==========================================
+# HANDLER: teks biasa (deteksi link tempelan)
+# ==========================================
+async def terima_teks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Kalau user menempel link Google Sheets tanpa perintah apa pun,
+       langsung daftarkan. Kalau belum terdaftar & tak ada link, tampilkan panduan."""
+    teks = (update.message.text or "").strip()
+
+    if "spreadsheets" in teks.lower():
+        sid = ekstrak_id_spreadsheet(teks)
+        if sid:
+            await _proses_daftar(update, sid, update.effective_user)
+            return
+
+    # Bukan link. Kalau user belum terdaftar, bantu dengan panduan.
+    if not get_spreadsheet_id(update.effective_user.id):
+        await update.message.reply_text(pesan_belum_daftar(), parse_mode="Markdown")
+
+
+# ==========================================
 # HANDLER: /info
 # ==========================================
 async def info(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -747,7 +780,7 @@ async def info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"📄 Spreadsheet terhubung: *{judul}*\n"
         f"🔗 https://docs.google.com/spreadsheets/d/{sid}/edit\n\n"
-        f"Mau ganti spreadsheet? Kirim `/daftar <id_baru>`",
+        f"Mau ganti spreadsheet? Tempel link spreadsheet baru di sini.",
         parse_mode="Markdown",
     )
 
@@ -1187,6 +1220,7 @@ def main():
     app.add_handler(CommandHandler("dummy", dummy))
     app.add_handler(CommandHandler("hapusdummy", hapusdummy))
     app.add_handler(MessageHandler(filters.PHOTO, terima_foto))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, terima_teks))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_error_handler(error_handler)
 
