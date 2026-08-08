@@ -1104,7 +1104,7 @@ async def terima_foto(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "nominal": nominal,
             "merchant": hasil.get("merchant", "-"),
             "sumber": "Struk",
-            "catatan": "",
+            "catatan": (update.message.caption or "").strip(),
         }
         token = buat_token(data)
 
@@ -1113,7 +1113,8 @@ async def terima_foto(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🏪 Merchant: {data['merchant']}\n"
             f"📅 Tanggal: {data['tanggal']}\n"
             f"🏷️ Kategori: {data['kategori']}\n"
-            f"💰 Nominal: Rp{nominal:,}\n\n"
+            f"💰 Nominal: Rp{nominal:,}\n"
+            f"📝 Catatan: {data['catatan'] or '-'}\n\n"
             f"Simpan data ini?",
             parse_mode="Markdown",
             reply_markup=keyboard_konfirmasi_struk(token),
