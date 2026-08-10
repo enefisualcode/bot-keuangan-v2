@@ -23,6 +23,7 @@ import json
 import re
 import os
 import uuid
+import asyncio
 from datetime import datetime
 
 import gspread
@@ -47,6 +48,9 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 # Spreadsheet MASTER milik pemilik bot -> tempat menyimpan daftar user
 MASTER_SPREADSHEET_ID = os.environ.get("MASTER_SPREADSHEET_ID", "")
 USERS_SHEET = os.environ.get("USERS_SHEET", "Users")
+
+# Telegram ID pemilik bot (untuk /umumkan). Cek ID-mu lewat /myid.
+ADMIN_ID = os.environ.get("ADMIN_ID", "").strip()
 
 # Nama sheet di spreadsheet masing-masing user
 SHEET_PENGELUARAN = os.environ.get("SHEET_PENGELUARAN", "Pengeluaran")
@@ -1259,6 +1263,152 @@ def cek_konfigurasi():
         raise SystemExit(1)
 
 
+# ==========================================
+# AI: tanya-jawab & analisa atas data user
+# ==========================================
+def data_untuk_ai(sid, batas=800):
+    """Ambil transaksi user jadi teks ringkas untuk dianalisis AI.
+    Format tiap baris: tanggal|OUT/IN|kategori|nominal|merchant|catatan|tipe_bayar"""
+    ss = get_client().open_by_key(sid)
+    baris = []
+    try:
+        out = ss.worksheet(SHEET_PENGELUARAN).get_all_values()[1:]  # tanpa header
+        for r in out[-batas:]:
+            g = lambda i: r[i] if len(r) > i else ""
+            baris.append(f"{g(0)}|OUT|{g(1)}|{g(2)}|{g(3)}|{g(5)}|{g(6)}")
+    except Exception as e:
+        logger.error(f"AI baca pengeluaran: {e}")
+    try:
+        inc = ss.worksheet(SHEET_PEMASUKAN).get_all_values()[1:]
+        for r in inc[-batas:]:
+            g = lambda i: r[i] if len(r) > i else ""
+            baris.append(f"{g(0)}|IN|{g(1)}|{g(2)}||{g(4)}|")
+    except Exception as e:
+        logger.error(f"AI baca pemasukan: {e}")
+    return "\n".join(baris)
+
+
+async def tanya(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    sid = get_spreadsheet_id(user_id)
+    if not sid:
+        await update.message.reply_text(pesan_belum_daftar(), parse_mode="Markdown")
+        return
+
+    pertanyaan = " ".join(context.args).strip()
+    if not pertanyaan:
+        await update.message.reply_text(
+            "❓ Tanya apa saja soal keuanganmu.\n\n"
+            "Contoh:\n"
+            "`/tanya berapa kali saya ngopi minggu ini`\n"
+            "`/tanya total uang untuk kopi bulan ini`\n"
+            "`/tanya berapa kali saya main warnet`\n"
+            "`/tanya beri saran biar lebih hemat`",
+            parse_mode="Markdown",
+        )
+        return
+
+    await update.message.reply_text("🤔 Menganalisis datamu...")
+    try:
+        data = data_untuk_ai(sid)
+        if not data.strip():
+            await update.message.reply_text("Belum ada transaksi untuk dianalisis.")
+            return
+
+        hari_ini = datetime.now().strftime("%Y-%m-%d")
+        prompt = f"""Kamu asisten keuangan pribadi. Hari ini {hari_ini}.
+Di bawah ini data transaksi user, satu baris per transaksi dengan format:
+tanggal|OUT/IN|kategori|nominal|merchant|catatan|tipe_bayar
+OUT = pengeluaran, IN = pemasukan. Nominal dalam Rupiah.
+Siklus periode keuangan: tanggal 25 sampai 24 bulan berikutnya.
+
+DATA:
+{data}
+
+PERTANYAAN USER:
+{pertanyaan}
+
+Aturan menjawab:
+- Bahasa Indonesia, ringkas, langsung ke inti.
+- Hitung dari data di atas (jumlah, frekuensi, rata-rata, total) seakurat mungkin.
+  Untuk mencocokkan hal seperti "kopi" atau "warnet", lihat kategori, merchant, dan catatan.
+- Kalau diminta saran/analisa, beri yang praktis & spesifik berbasis pola data.
+- Kalau data tidak cukup untuk menjawab, katakan apa adanya. Jangan mengarang transaksi."""
+        resp = gemini_model.generate_content(prompt)
+        jawab = (resp.text or "").strip() or "Maaf, aku tidak bisa menjawab itu."
+        await update.message.reply_text(jawab[:4000])  # batas Telegram ~4096
+    except Exception as e:
+        logger.error(f"Gagal /tanya: {e}")
+        await update.message.reply_text("❌ Gagal menganalisis. Coba lagi sebentar.")
+
+
+# ==========================================
+# /myid  &  /fitur
+# ==========================================
+async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    await update.message.reply_text(
+        f"🆔 Telegram ID kamu: `{u.id}`\n"
+        f"👤 Username: @{u.username or '-'}",
+        parse_mode="Markdown",
+    )
+
+
+TEKS_FITUR = (
+    "✨ *Fitur bot ini:*\n\n"
+    "📝 *Catat pengeluaran*\n"
+    "`/catat 50000 Makan nasi goreng`\n"
+    "• Tambah *note* pakai `;` → `/catat 50000 Makan ; ditalangin, tagih Andi`\n"
+    "• Ketik *kemarin* untuk tanggal kemarin → `/catat 20000 Kopi kemarin`\n\n"
+    "💵 *Catat pemasukan*\n"
+    "`/masuk 5000000 Gaji`\n\n"
+    "📸 *Foto struk otomatis*\n"
+    "Kirim foto struk, dibaca sendiri. *Caption foto* jadi catatannya.\n\n"
+    "🤖 *Tanya AI* soal keuanganmu\n"
+    "`/tanya berapa kali saya ngopi minggu ini`\n"
+    "`/tanya beri saran biar lebih hemat`\n\n"
+    "📊 *Dashboard web* — ringkasan, grafik, Total Pay Later per periode.\n"
+    "Lihat spreadsheet & dashboard: `/info`"
+)
+
+
+async def fitur(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(TEKS_FITUR, parse_mode="Markdown")
+
+
+# ==========================================
+# /umumkan — broadcast ke semua user (khusus developer)
+# ==========================================
+async def umumkan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not ADMIN_ID or str(update.effective_user.id) != ADMIN_ID:
+        await update.message.reply_text("⛔ Perintah ini khusus developer.")
+        return
+
+    pesan = " ".join(context.args).strip()
+    if not pesan:
+        await update.message.reply_text(
+            "Tulis pesannya:\n`/umumkan Halo! Ada fitur baru: ...`",
+            parse_mode="Markdown",
+        )
+        return
+
+    uids = list(load_user_map(force=True).keys())
+    await update.message.reply_text(f"📢 Mengirim ke {len(uids)} user...")
+
+    teks = "📢 Info dari developer:\n\n" + pesan   # tanpa Markdown, biar tak gagal
+    sukses = gagal = 0
+    for uid in uids:
+        try:
+            await context.bot.send_message(chat_id=int(uid), text=teks)
+            sukses += 1
+        except Exception as e:
+            gagal += 1
+            logger.warning(f"broadcast gagal ke {uid}: {e}")
+        await asyncio.sleep(0.05)   # jaga batas kirim Telegram
+
+    await update.message.reply_text(f"✅ Terkirim: {sukses} | Gagal: {gagal}")
+
+
 def main():
     cek_konfigurasi()
     load_user_map(force=True)
@@ -1273,6 +1423,10 @@ def main():
     app.add_handler(CommandHandler("masuk", catat_masuk))
     app.add_handler(CommandHandler("dummy", dummy))
     app.add_handler(CommandHandler("hapusdummy", hapusdummy))
+    app.add_handler(CommandHandler("tanya", tanya))
+    app.add_handler(CommandHandler("fitur", fitur))
+    app.add_handler(CommandHandler("myid", myid))
+    app.add_handler(CommandHandler("umumkan", umumkan))
     app.add_handler(MessageHandler(filters.PHOTO, terima_foto))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, terima_teks))
     app.add_handler(CallbackQueryHandler(callback_handler))
