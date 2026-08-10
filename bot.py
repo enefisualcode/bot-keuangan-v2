@@ -758,7 +758,14 @@ async def daftar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def terima_teks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Kalau user menempel link Google Sheets tanpa perintah apa pun,
        langsung daftarkan. Kalau belum terdaftar & tak ada link, tampilkan panduan."""
+    user_id = update.effective_user.id
     teks = (update.message.text or "").strip()
+
+    # Sedang mode saran? Teruskan teks ini ke developer.
+    if user_id in menunggu_saran:
+        menunggu_saran.discard(user_id)
+        await _teruskan_saran(update, context, teks=teks)
+        return
 
     if "spreadsheets" in teks.lower():
         sid = ekstrak_id_spreadsheet(teks)
@@ -1046,6 +1053,18 @@ async def catat_masuk(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==========================================
 async def terima_foto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    caption = (update.message.caption or "").strip()
+    photo_id = update.message.photo[-1].file_id
+
+    # Foto sebagai SARAN: mode saran aktif, atau caption diawali /saran.
+    if user_id in menunggu_saran or caption.lower().startswith("/saran"):
+        menunggu_saran.discard(user_id)
+        if caption.lower().startswith("/saran"):
+            p = caption.split(maxsplit=1)
+            caption = p[1].strip() if len(p) > 1 else ""
+        await _teruskan_saran(update, context, teks=caption, photo_id=photo_id)
+        return
+
     if not get_spreadsheet_id(user_id):
         await update.message.reply_text(pesan_belum_daftar(), parse_mode="Markdown")
         return
@@ -1368,7 +1387,9 @@ TEKS_FITUR = (
     "`/tanya berapa kali saya ngopi minggu ini`\n"
     "`/tanya beri saran biar lebih hemat`\n\n"
     "📊 *Dashboard web* — ringkasan, grafik, Total Pay Later per periode.\n"
-    "Lihat spreadsheet & dashboard: `/info`"
+    "Lihat spreadsheet & dashboard: `/info`\n\n"
+    "💡 *Punya saran?* Kirim ke developer dengan `/saran`\n"
+    "(boleh teks, atau foto beserta caption)."
 )
 
 
@@ -1411,6 +1432,61 @@ async def umumkan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Terkirim: {sukses} | Gagal: {gagal}")
 
 
+# ==========================================
+# /saran — user kirim masukan ke developer
+# ==========================================
+menunggu_saran = set()   # user_id yang sedang diminta mengetik saran
+
+
+async def _teruskan_saran(update, context, teks="", photo_id=None):
+    if not ADMIN_ID:
+        await update.message.reply_text("⚠️ Fitur saran belum aktif. Coba lagi nanti ya.")
+        return
+    u = update.effective_user
+    header = f"💡 Saran dari @{u.username or '-'} (ID {u.id}):"
+    try:
+        if photo_id:
+            cap = (header + "\n\n" + teks) if teks else header
+            await context.bot.send_photo(
+                chat_id=int(ADMIN_ID), photo=photo_id, caption=cap[:1024]
+            )
+        else:
+            await context.bot.send_message(
+                chat_id=int(ADMIN_ID), text=(header + "\n\n" + teks)[:4000]
+            )
+        await update.message.reply_text(
+            "✅ Terima kasih! Saranmu sudah terkirim ke developer. 🙏"
+        )
+    except Exception as e:
+        logger.error(f"Gagal kirim saran: {e}")
+        await update.message.reply_text("❌ Gagal mengirim saran. Coba lagi sebentar.")
+
+
+async def saran(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    bagian = (update.message.text or "").split(maxsplit=1)
+    teks = bagian[1].strip() if len(bagian) > 1 else ""
+
+    if teks:
+        menunggu_saran.discard(user_id)
+        await _teruskan_saran(update, context, teks=teks)
+    else:
+        menunggu_saran.add(user_id)
+        await update.message.reply_text(
+            "💡 Silakan kirim saranmu — boleh *teks*, atau *foto beserta caption*.\n"
+            "Ketik /batal untuk membatalkan.",
+            parse_mode="Markdown",
+        )
+
+
+async def batal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id in menunggu_saran:
+        menunggu_saran.discard(update.effective_user.id)
+        await update.message.reply_text("Dibatalkan. 👍")
+    else:
+        await update.message.reply_text("Tidak ada yang perlu dibatalkan.")
+
+
 def main():
     cek_konfigurasi()
     load_user_map(force=True)
@@ -1427,6 +1503,8 @@ def main():
     app.add_handler(CommandHandler("hapusdummy", hapusdummy))
     app.add_handler(CommandHandler("tanya", tanya))
     app.add_handler(CommandHandler("fitur", fitur))
+    app.add_handler(CommandHandler("saran", saran))
+    app.add_handler(CommandHandler("batal", batal))
     app.add_handler(CommandHandler("myid", myid))
     app.add_handler(CommandHandler("umumkan", umumkan))
     app.add_handler(MessageHandler(filters.PHOTO, terima_foto))
