@@ -1384,7 +1384,9 @@ async def umumkan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ Perintah ini khusus developer.")
         return
 
-    pesan = " ".join(context.args).strip()
+    # Ambil teks apa adanya (jangan pakai context.args -> baris baru hilang).
+    bagian = (update.message.text or "").split(maxsplit=1)
+    pesan = bagian[1].strip() if len(bagian) > 1 else ""
     if not pesan:
         await update.message.reply_text(
             "Tulis pesannya:\n`/umumkan Halo! Ada fitur baru: ...`",
