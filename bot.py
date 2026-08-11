@@ -72,9 +72,67 @@ except Exception:
     SERVICE_ACCOUNT_EMAIL = "(cek credentials.json)"
 
 HEADER_PENGELUARAN = ["Tanggal", "Kategori", "Nominal", "Merchant",
-                      "Sumber", "Catatan", "Tipe Bayar"]
+                      "Sumber", "Catatan", "Tipe Bayar", "Barang"]
 HEADER_PEMASUKAN = ["Tanggal", "Kategori", "Nominal", "Sumber", "Catatan"]
 HEADER_USERS = ["user_id", "username", "spreadsheet_id", "tanggal_daftar"]
+
+# ==========================================
+# KATEGORI BAKU + normalisasi
+# ==========================================
+KATEGORI_BAKU = ["Makan", "Ngopi", "Transport", "Belanja",
+                 "Hiburan", "Tagihan", "Investasi", "Lainnya"]
+
+# Kata kunci -> kategori. Dicocokkan ke gabungan (kategori + merchant), huruf kecil.
+# Urutan penting: yang lebih spesifik didahulukan; "Makan" paling umum, ditaruh akhir.
+PETA_KATEGORI = {
+    "Investasi": ["investasi", "invest", "indodax", "kripto", "crypto", "bitcoin",
+                  "btc", "reksadana", "saham", "bibit", "ajaib", "pluang", "pintu",
+                  "emas", "antam", "deposito", "kki-depo"],
+    "Tagihan": ["tagihan", "pln", "listrik", "pulsa", "paket data", "indihome",
+                "wifi", "apple", "icloud", "google", "langganan", "subscription",
+                "cicilan", "pay later", "paylater", "kredivo", "akulaku",
+                "spaylater", "bpjs", "asuransi", "netflix", "spotify"],
+    "Hiburan": ["hiburan", "warnet", "game", "gaming", "spade", "arafah", "aratan",
+                "playstation", "bioskop", "cinema", "xxi", "cgv", "steam",
+                "billiard", "biliar", "karaoke", "goc"],
+    "Transport": ["transport", "bensin", "pertamina", "shell", "vivo", "parkir",
+                  "parkiran", "ojek", "gojek", "grab", "gocar", "goride", "maxim",
+                  "krl", "mrt", "busway", "transjakarta", "tol", "e-toll", "spbu",
+                  "bbm", "solar", "pertalite", "pertamax"],
+    "Belanja": ["belanja", "alfamart", "alfamidi", "indomaret", "tokopedia",
+                "shopee", "lazada", "tokped", "skintific", "pinzy", "jastip",
+                "store", "mart", "market", "supermarket", "hypermart", "watsons",
+                "guardian", "pinzy"],
+    "Ngopi": ["kopi", "coffee", "fore", "kenangan", "starbucks", "janji jiwa",
+              "point coffee", "tuku", "juice", "jus", "boba", "milk tea",
+              "es teh", "ngopi"],
+    "Makan": ["makan", "warteg", "nasi", "ayam", "bakso", "mie", "sushi",
+              "gorengan", "cimol", "gado", "kebab", "roti", "kantin", "warung",
+              "resto", "food", "seblak", "telor", "telur", "jajan", "snack",
+              "martabak", "sate", "soto", "padang", "geprek", "burger", "pizza",
+              "kfc", "mcd", "richeese", "dimsum", "hachi", "kabobs", "goreng"],
+}
+
+
+def normalkan_kategori(teks, merchant="", paksa=False):
+    """Petakan kategori bebas ke salah satu KATEGORI_BAKU.
+    - Kalau sudah kategori baku (selain Lainnya), dihormati.
+    - Kalau Lainnya/tak jelas, coba diselamatkan lewat kata kunci + nama merchant.
+    - paksa=True (untuk struk): kalau tetap tak cocok -> Lainnya.
+    - paksa=False (manual): kalau tak cocok -> hormati yang diketik user."""
+    t = (teks or "").strip()
+    for k in KATEGORI_BAKU:
+        if t.lower() == k.lower():
+            if k != "Lainnya":
+                return k
+            break
+    kandidat = f"{t} {merchant}".lower()
+    for kategori, kata in PETA_KATEGORI.items():
+        if any(kk in kandidat for kk in kata):
+            return kategori
+    if paksa:
+        return "Lainnya"
+    return t.title() if t else "Lainnya"
 
 # ==========================================
 # LOGGING
@@ -538,12 +596,12 @@ def get_spreadsheet_id(user_id):
 # Tulis transaksi ke spreadsheet milik user
 # ------------------------------------------
 def simpan_pengeluaran(user_id, tanggal, kategori, nominal, merchant,
-                       sumber, catatan, tipe_bayar):
+                       sumber, catatan, tipe_bayar, barang=""):
     sid = get_spreadsheet_id(user_id)
     ss = get_client().open_by_key(sid)
     ws = get_or_create_worksheet(ss, SHEET_PENGELUARAN, HEADER_PENGELUARAN)
     ws.append_row(
-        [tanggal, kategori, nominal, merchant, sumber, catatan, tipe_bayar],
+        [tanggal, kategori, nominal, merchant, sumber, catatan, tipe_bayar, barang],
         value_input_option="USER_ENTERED",
     )
 
@@ -756,26 +814,101 @@ async def daftar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # HANDLER: teks biasa (deteksi link tempelan)
 # ==========================================
 async def terima_teks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Kalau user menempel link Google Sheets tanpa perintah apa pun,
-       langsung daftarkan. Kalau belum terdaftar & tak ada link, tampilkan panduan."""
+    """Alur teks biasa (bukan command):
+       1) mode saran  2) link spreadsheet  3) belum daftar -> panduan
+       4) sudah daftar -> coba pahami sebagai pencatatan belanja bebas."""
     user_id = update.effective_user.id
     teks = (update.message.text or "").strip()
 
-    # Sedang mode saran? Teruskan teks ini ke developer.
+    # 1. Sedang mode saran?
     if user_id in menunggu_saran:
         menunggu_saran.discard(user_id)
         await _teruskan_saran(update, context, teks=teks)
         return
 
+    # 2. Link spreadsheet -> daftarkan
     if "spreadsheets" in teks.lower():
         sid = ekstrak_id_spreadsheet(teks)
         if sid:
             await _proses_daftar(update, sid, update.effective_user)
             return
 
-    # Bukan link. Kalau user belum terdaftar, bantu dengan panduan.
-    if not get_spreadsheet_id(update.effective_user.id):
+    # 3. Belum terdaftar -> panduan
+    if not get_spreadsheet_id(user_id):
         await update.message.reply_text(pesan_belum_daftar(), parse_mode="Markdown")
+        return
+
+    # 4. Terdaftar -> coba pahami sebagai pencatatan belanja
+    if teks:
+        await _proses_teks_belanja(update, teks, user_id)
+
+
+async def _proses_teks_belanja(update, teks, user_id):
+    """Urai kalimat bebas (mis. 'jajan bakso 20rb di warung Ali') jadi transaksi."""
+    hari_ini = datetime.now().strftime("%Y-%m-%d")
+    prompt = f"""Ubah kalimat belanja berikut jadi JSON. Hari ini {hari_ini}.
+Kalimat: "{teks}"
+
+Balas HANYA JSON, tanpa markdown, bentuk:
+{{"nominal": angka_tanpa_titik, "kategori": "salah satu dari: Makan, Ngopi, Transport, Belanja, Hiburan, Tagihan, Investasi, Lainnya", "merchant": "nama toko/tempat atau '-'", "items": "daftar barang pisah koma atau ''"}}
+
+Aturan:
+- nominal rupiah: "20rb"/"20 ribu" = 20000, "1,5jt"/"1.5 juta" = 1500000.
+- Kalau kalimat BUKAN pencatatan belanja/pengeluaran (mis. pertanyaan, sapaan, perintah), balas {{"nominal": 0}}."""
+    try:
+        resp = gemini_model.generate_content(prompt)
+        raw = (resp.text or "").strip().replace("```json", "").replace("```", "").strip()
+        hasil = json.loads(raw)
+    except Exception as e:
+        logger.error(f"parse teks belanja: {e}")
+        await update.message.reply_text(
+            "Hmm, aku belum paham 🤔\n"
+            "Untuk mencatat pengeluaran: ketik `/catat` atau langsung "
+            "seperti \"jajan bakso 20rb\".\n"
+            "Untuk bertanya soal keuangan: `/tanya`.",
+            parse_mode="Markdown",
+        )
+        return
+
+    try:
+        nominal = int(hasil.get("nominal") or 0)
+    except (ValueError, TypeError):
+        nominal = 0
+
+    if nominal <= 0:
+        await update.message.reply_text(
+            "Kalau mau mencatat pengeluaran, sebutkan nominalnya ya.\n"
+            "Contoh: \"jajan bakso 20rb di warung Ali\"\n\n"
+            "Mau tanya soal keuangan? Pakai /tanya. Punya masukan? /saran."
+        )
+        return
+
+    kategori = normalkan_kategori(
+        hasil.get("kategori", "Lainnya"), hasil.get("merchant", ""), paksa=True
+    )
+    data = {
+        "user_id": user_id,
+        "jenis": "pengeluaran",
+        "tanggal": hari_ini,
+        "kategori": kategori,
+        "nominal": nominal,
+        "merchant": (hasil.get("merchant") or "-").strip() or "-",
+        "sumber": "Teks",
+        "catatan": "",
+        "barang": (hasil.get("items") or "").strip(),
+    }
+    token = buat_token(data)
+    await update.message.reply_text(
+        f"📋 *Detail Pengeluaran:*\n\n"
+        f"🏪 Merchant: {data['merchant']}\n"
+        f"📅 Tanggal: {data['tanggal']}\n"
+        f"🏷️ Kategori: {data['kategori']}\n"
+        f"🛒 Barang: {data['barang'] or '-'}\n"
+        f"💰 Nominal: Rp{nominal:,}\n\n"
+        f"Pilih tipe pembayaran:",
+        parse_mode="Markdown",
+        reply_markup=keyboard_tipe_bayar(token),
+    )
 
 
 # ==========================================
@@ -977,7 +1110,7 @@ async def catat_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "user_id": user_id,
         "jenis": "pengeluaran",
         "tanggal": tanggal,
-        "kategori": sisa[0].title(),
+        "kategori": normalkan_kategori(sisa[0]),
         "nominal": nominal,
         "merchant": "-",
         "sumber": "Manual",
@@ -1088,8 +1221,19 @@ async def terima_foto(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "merchant": "nama toko/tempat",
             "tanggal": "YYYY-MM-DD (kalau tidak jelas gunakan {hari_ini})",
             "nominal": angka_total_tanpa_titik_atau_koma,
-            "kategori": "Makan / Transport / Belanja / Tagihan / Lainnya"
+            "items": "daftar barang yang dibeli, pisahkan dengan koma (kalau tidak jelas isi '')",
+            "kategori": "WAJIB pilih SATU dari: Makan, Ngopi, Transport, Belanja, Hiburan, Tagihan, Investasi, Lainnya"
         }}
+
+        Panduan memilih kategori (tebak dari nama merchant/isi struk):
+        - Makan: makanan (warteg, kebab, bakso, sushi, gorengan, gado-gado, dll)
+        - Ngopi: kopi & minuman (Fore, Kopi Kenangan, juice, boba)
+        - Transport: bensin/SPBU, parkir, ojek online, KRL/MRT, tol
+        - Belanja: minimarket & toko online (Alfamart, Tokopedia, Shopee, Skintific, jastip)
+        - Hiburan: warnet/game center, bioskop, langganan hiburan
+        - Tagihan: listrik/PLN, pulsa/data, Apple/Google, cicilan, Pay Later
+        - Investasi: Indodax, kripto, reksadana, saham, emas
+        - Lainnya: hanya jika benar-benar tidak masuk kategori mana pun
 
         Ambil TOTAL akhir yang dibayar.
         Jika gambar berisi LEBIH DARI SATU struk, isi nominal dengan -1.
@@ -1123,7 +1267,12 @@ async def terima_foto(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "user_id": user_id,
             "jenis": "pengeluaran",
             "tanggal": hasil.get("tanggal") or hari_ini,
-            "kategori": hasil.get("kategori", "Lainnya"),
+            "kategori": normalkan_kategori(
+                hasil.get("kategori", "Lainnya"),
+                hasil.get("merchant", ""),
+                paksa=True,
+            ),
+            "barang": (hasil.get("items") or "").strip(),
             "nominal": nominal,
             "merchant": hasil.get("merchant", "-"),
             "sumber": "Struk",
@@ -1187,6 +1336,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🏪 Merchant: {data['merchant']}\n"
             f"📅 Tanggal: {data['tanggal']}\n"
             f"🏷️ Kategori: {data['kategori']}\n"
+            f"🛒 Barang: {data.get('barang') or '-'}\n"
             f"💰 Nominal: Rp{data['nominal']:,}\n\n"
             f"Pilih tipe pembayaran:",
             parse_mode="Markdown",
@@ -1208,6 +1358,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 sumber=data.get("sumber", "Manual"),
                 catatan=data.get("catatan", ""),
                 tipe_bayar=tipe,
+                barang=data.get("barang", ""),
             )
             pending.pop(token, None)
             await query.edit_message_text(
