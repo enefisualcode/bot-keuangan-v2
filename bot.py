@@ -1638,6 +1638,65 @@ async def batal(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Tidak ada yang perlu dibatalkan.")
 
 
+# ==========================================
+# /statususer — cek aktivitas semua user (khusus developer)
+# ==========================================
+async def statususer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not ADMIN_ID or str(update.effective_user.id) != ADMIN_ID:
+        await update.message.reply_text("⛔ Perintah ini khusus developer.")
+        return
+
+    await update.message.reply_text("📊 Mengecek aktivitas user...")
+    try:
+        records = get_users_sheet().get_all_records()
+    except Exception as e:
+        logger.error(f"statususer baca users: {e}")
+        await update.message.reply_text("❌ Gagal membaca daftar user.")
+        return
+
+    hari_ini = datetime.now().date()
+    baris = []
+    aktif = 0
+    for rec in records:
+        uname = rec.get("username") or "-"
+        sid = rec.get("spreadsheet_id", "")
+        jumlah = 0
+        terakhir = None
+        try:
+            ss = get_client().open_by_key(sid)
+            nilai = ss.worksheet(SHEET_PENGELUARAN).get_all_values()[1:]
+            for r in nilai:
+                if r and r[0]:
+                    jumlah += 1
+                    try:
+                        d = datetime.strptime(str(r[0])[:10], "%Y-%m-%d").date()
+                        if terakhir is None or d > terakhir:
+                            terakhir = d
+                    except ValueError:
+                        pass
+        except Exception:
+            baris.append(f"⚠️ @{uname} — tak bisa dibaca (akses/sheet?)")
+            continue
+
+        if terakhir is None:
+            baris.append(f"🔴 @{uname} — belum ada transaksi")
+            continue
+
+        selisih = (hari_ini - terakhir).days
+        tgl = terakhir.strftime("%Y-%m-%d")
+        if selisih <= 7:
+            status = "🟢 aktif"
+            aktif += 1
+        elif selisih <= 30:
+            status = "🟡 jarang"
+        else:
+            status = f"🔴 tidak aktif ({selisih} hr)"
+        baris.append(f"{status} @{uname} — {jumlah} transaksi, terakhir {tgl}")
+
+    kepala = f"📊 Status {len(records)} user ({aktif} aktif minggu ini):\n\n"
+    await update.message.reply_text((kepala + "\n".join(baris))[:4000])
+
+
 def main():
     cek_konfigurasi()
     load_user_map(force=True)
@@ -1658,6 +1717,7 @@ def main():
     app.add_handler(CommandHandler("batal", batal))
     app.add_handler(CommandHandler("myid", myid))
     app.add_handler(CommandHandler("umumkan", umumkan))
+    app.add_handler(CommandHandler("statususer", statususer))
     app.add_handler(MessageHandler(filters.PHOTO, terima_foto))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, terima_teks))
     app.add_handler(CallbackQueryHandler(callback_handler))
