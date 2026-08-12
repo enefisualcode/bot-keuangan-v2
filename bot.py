@@ -677,17 +677,17 @@ def keyboard_kategori_pemasukan(token):
 def pesan_belum_daftar():
     return (
         "🔐 *Kamu belum menghubungkan spreadsheet.*\n\n"
-        "Bot ini menulis ke Google Spreadsheet milikmu sendiri, "
-        "jadi datamu tidak tercampur dengan pengguna lain.\n\n"
-        "*Cara menghubungkan (3 langkah):*\n\n"
-        "1️⃣ Buka Google Sheets, buat spreadsheet baru (boleh kosong).\n\n"
-        "2️⃣ Klik *Bagikan*, masukkan email ini sebagai *Editor*:\n"
-        f"`{SERVICE_ACCOUNT_EMAIL}`\n\n"
-        "3️⃣ Salin *link* spreadsheet-nya "
-        "(dari address bar, atau tombol *Bagikan → Salin link*), "
-        "lalu *tempel di sini* dan kirim.\n\n"
-        "Selesai — kolom, sheet, dan dashboard saya buat otomatis.\n"
-        "_Tidak perlu ketik perintah apa pun; cukup tempel link-nya._"
+        "Bot ini menyimpan datamu di Google Spreadsheet milikmu sendiri.\n\n"
+        "*⚡ Cara termudah:*\n"
+        "Kirim saja *email Gmail* kamu ke sini — nanti aku buatkan "
+        "spreadsheet-nya dan langsung ku-share ke kamu.\n"
+        "Contoh: ketik `namakamu@gmail.com`\n\n"
+        "*🛠️ Cara manual* (kalau mau buat sendiri):\n"
+        "1️⃣ Buat spreadsheet baru di Google Sheets\n"
+        "2️⃣ Bagikan ke email ini sebagai *Editor*:\n"
+        f"`{SERVICE_ACCOUNT_EMAIL}`\n"
+        "3️⃣ Tempel *link* spreadsheet-nya ke sini\n\n"
+        "_Kolom, sheet, dan dashboard saya buat otomatis._"
     )
 
 
@@ -811,6 +811,60 @@ async def daftar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ==========================================
+# JALUR CEPAT: bot membuatkan spreadsheet untuk user
+# ==========================================
+def valid_email(s):
+    return bool(re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", (s or "").strip()))
+
+
+async def _buatkan_spreadsheet(update, email, user):
+    email = email.strip()
+    if not valid_email(email):
+        await update.message.reply_text(
+            "Email-nya sepertinya tidak valid. Contoh: `namakamu@gmail.com`",
+            parse_mode="Markdown",
+        )
+        return
+
+    await update.message.reply_text("⏳ Membuatkan spreadsheet untukmu...")
+    try:
+        ss = get_client().create(f"Keuangan - {user.username or user.id}")
+        ss.share(email, perm_type="user", role="writer")
+    except Exception as e:
+        logger.error(f"Gagal buatkan spreadsheet {user.id}: {e}")
+        await update.message.reply_text(
+            "❌ Maaf, aku belum bisa membuatkan otomatis sekarang.\n\n"
+            "Pakai cara manual ya 👇\n\n" + pesan_belum_daftar(),
+            parse_mode="Markdown",
+        )
+        return
+
+    # Sheet sudah dibuat & di-share. Jalankan setup + simpan lewat alur yang ada.
+    await _proses_daftar(update, ss.id, user)
+    await update.message.reply_text(
+        f"🔗 Ini spreadsheet-mu (sudah ku-share ke {email}):\n"
+        f"https://docs.google.com/spreadsheets/d/{ss.id}/edit\n\n"
+        f"Buka dari Google Sheets → menu *Dibagikan kepada saya*.",
+        parse_mode="Markdown",
+    )
+
+
+async def buatkan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if get_spreadsheet_id(update.effective_user.id):
+        await update.message.reply_text("Kamu sudah terhubung. Cek dengan /info.")
+        return
+    email = " ".join(context.args).strip()
+    if not email:
+        await update.message.reply_text(
+            "Ketik email Gmail-mu setelah perintah, contoh:\n"
+            "`/buatkan namakamu@gmail.com`",
+            parse_mode="Markdown",
+        )
+        return
+    await _buatkan_spreadsheet(update, email, update.effective_user)
+
+
+# ==========================================
 # HANDLER: teks biasa (deteksi link tempelan)
 # ==========================================
 async def terima_teks(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -833,8 +887,12 @@ async def terima_teks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _proses_daftar(update, sid, update.effective_user)
             return
 
-    # 3. Belum terdaftar -> panduan
+    # 3. Belum terdaftar
     if not get_spreadsheet_id(user_id):
+        # Kirim email Gmail? Buatkan otomatis.
+        if valid_email(teks):
+            await _buatkan_spreadsheet(update, teks, update.effective_user)
+            return
         await update.message.reply_text(pesan_belum_daftar(), parse_mode="Markdown")
         return
 
@@ -1706,6 +1764,7 @@ def main():
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("daftar", daftar))
+    app.add_handler(CommandHandler("buatkan", buatkan))
     app.add_handler(CommandHandler("info", info))
     app.add_handler(CommandHandler("catat", catat_manual))
     app.add_handler(CommandHandler("masuk", catat_masuk))
