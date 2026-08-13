@@ -676,18 +676,24 @@ def keyboard_kategori_pemasukan(token):
 # ==========================================
 def pesan_belum_daftar():
     return (
-        "🔐 *Kamu belum menghubungkan spreadsheet.*\n\n"
-        "Bot ini menyimpan datamu di Google Spreadsheet milikmu sendiri.\n\n"
-        "*⚡ Cara termudah:*\n"
-        "Kirim saja *email Gmail* kamu ke sini — nanti aku buatkan "
-        "spreadsheet-nya dan langsung ku-share ke kamu.\n"
-        "Contoh: ketik `namakamu@gmail.com`\n\n"
-        "*🛠️ Cara manual* (kalau mau buat sendiri):\n"
-        "1️⃣ Buat spreadsheet baru di Google Sheets\n"
-        "2️⃣ Bagikan ke email ini sebagai *Editor*:\n"
-        f"`{SERVICE_ACCOUNT_EMAIL}`\n"
-        "3️⃣ Tempel *link* spreadsheet-nya ke sini\n\n"
+        "🔐 Untuk mulai, hubungkan spreadsheet-mu — cuma 3 langkah:\n\n"
+        "1️⃣ Buat spreadsheet baru di Google Sheets.\n\n"
+        "2️⃣ Klik *Bagikan*, tempel email ini sebagai *Editor* "
+        "(ketuk untuk menyalin):\n"
+        f"`{SERVICE_ACCOUNT_EMAIL}`\n\n"
+        "3️⃣ Tempel *link* spreadsheet-nya ke sini.\n\n"
         "_Kolom, sheet, dan dashboard saya buat otomatis._"
+    )
+
+
+def pesan_cara_manual():
+    return (
+        "Yuk hubungkan manual, cuma 3 langkah:\n\n"
+        "1️⃣ Buat spreadsheet baru di Google Sheets.\n\n"
+        "2️⃣ Klik *Bagikan*, tempel email ini sebagai *Editor* "
+        "(ketuk untuk menyalin):\n"
+        f"`{SERVICE_ACCOUNT_EMAIL}`\n\n"
+        "3️⃣ Tempel *link* spreadsheet-nya ke sini."
     )
 
 
@@ -833,8 +839,7 @@ async def _buatkan_spreadsheet(update, email, user):
     except Exception as e:
         logger.error(f"Gagal buatkan spreadsheet {user.id}: {e}")
         await update.message.reply_text(
-            "❌ Maaf, aku belum bisa membuatkan otomatis sekarang.\n\n"
-            "Pakai cara manual ya 👇\n\n" + pesan_belum_daftar(),
+            "❌ Maaf, aku belum bisa membuatkan otomatis sekarang.\n\n" + pesan_cara_manual(),
             parse_mode="Markdown",
         )
         return
@@ -887,12 +892,8 @@ async def terima_teks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _proses_daftar(update, sid, update.effective_user)
             return
 
-    # 3. Belum terdaftar
+    # 3. Belum terdaftar -> panduan manual
     if not get_spreadsheet_id(user_id):
-        # Kirim email Gmail? Buatkan otomatis.
-        if valid_email(teks):
-            await _buatkan_spreadsheet(update, teks, update.effective_user)
-            return
         await update.message.reply_text(pesan_belum_daftar(), parse_mode="Markdown")
         return
 
