@@ -897,9 +897,13 @@ async def terima_teks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(pesan_belum_daftar(), parse_mode="Markdown")
         return
 
-    # 4. Terdaftar -> coba pahami sebagai pencatatan belanja
+    # 4. Terdaftar -> query rekap atau catat belanja
     if teks:
-        await _proses_teks_belanja(update, teks, user_id)
+        low = teks.lower()
+        if low.startswith(("transaksi", "rekap", "laporan", "riwayat", "lihat")):
+            await _proses_rekap(update, teks, user_id)
+        else:
+            await _proses_teks_belanja(update, teks, user_id)
 
 
 async def _proses_teks_belanja(update, teks, user_id):
@@ -1241,6 +1245,125 @@ async def catat_masuk(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ==========================================
+# Cek duplikat & rekap transaksi
+# ==========================================
+def is_pertanyaan_cek(caption):
+    """True kalau caption terlihat seperti pertanyaan 'sudah pernah diupload?'."""
+    c = (caption or "").lower()
+    if not c:
+        return False
+    tanya = ("?" in c) or c.startswith("apakah")
+    kunci = ("sudah", "pernah", "duplikat", "belum", "double", "dobel",
+             "upload", "input", "diinput", "dicatat", "masuk")
+    return tanya and any(k in c for k in kunci)
+
+
+def cari_duplikat(sid, tanggal, nominal):
+    """Cari baris pengeluaran dengan tanggal & nominal sama. Return list dict."""
+    try:
+        ss = get_client().open_by_key(sid)
+        nilai = ss.worksheet(SHEET_PENGELUARAN).get_all_values()[1:]
+    except Exception as e:
+        logger.error(f"cek duplikat: {e}")
+        return []
+    target = re.sub(r"[^\d]", "", str(nominal))
+    cocok = []
+    for r in nilai:
+        if len(r) < 3 or not r[0]:
+            continue
+        if str(r[0])[:10] == str(tanggal)[:10] and re.sub(r"[^\d]", "", str(r[2])) == target:
+            cocok.append({
+                "kategori": r[1] if len(r) > 1 else "",
+                "merchant": r[3] if len(r) > 3 else "",
+                "catatan": r[5] if len(r) > 5 else "",
+            })
+    return cocok
+
+
+async def _proses_rekap(update, periode_teks, user_id):
+    """Tampilkan daftar transaksi pada periode yang diminta user."""
+    sid = get_spreadsheet_id(user_id)
+    if not sid:
+        await update.message.reply_text(pesan_belum_daftar(), parse_mode="Markdown")
+        return
+
+    hari_ini = datetime.now().strftime("%Y-%m-%d")
+    prompt = f"""Ubah deskripsi periode ini jadi rentang tanggal. Hari ini {hari_ini}.
+Deskripsi: "{periode_teks}"
+
+Balas HANYA JSON: {{"start":"YYYY-MM-DD","end":"YYYY-MM-DD"}}
+Aturan:
+- "1 agustus 2026" -> start=end=2026-08-01
+- "hari ini" -> {hari_ini}; "kemarin" -> sehari sebelum {hari_ini}
+- "minggu ini" -> Senin s/d Minggu minggu ini
+- "bulan ini" -> tanggal 1 s/d akhir bulan ini
+- kalau tak jelas, pakai {hari_ini} untuk start & end."""
+    try:
+        resp = gemini_model.generate_content(prompt)
+        raw = re.sub(r"^```json\s*|\s*```$", "", resp.text.strip()).strip()
+        rng = json.loads(raw)
+        start, end = rng["start"], rng["end"]
+    except Exception as e:
+        logger.error(f"parse periode rekap: {e}")
+        await update.message.reply_text(
+            "Aku belum paham periodenya 🤔\n"
+            "Contoh: `/rekap 1 agustus 2026`, `/rekap minggu ini`, `/rekap bulan ini`.",
+            parse_mode="Markdown",
+        )
+        return
+
+    try:
+        ss = get_client().open_by_key(sid)
+        out = ss.worksheet(SHEET_PENGELUARAN).get_all_values()[1:]
+        try:
+            inc = ss.worksheet(SHEET_PEMASUKAN).get_all_values()[1:]
+        except Exception:
+            inc = []
+    except Exception as e:
+        logger.error(f"baca rekap: {e}")
+        await update.message.reply_text("❌ Gagal membaca data.")
+        return
+
+    def in_range(tgl):
+        return start <= str(tgl)[:10] <= end
+
+    baris_out, total_out = [], 0
+    for r in out:
+        if r and r[0] and in_range(r[0]):
+            nom = int(re.sub(r"[^\d]", "", str(r[2])) or 0)
+            total_out += nom
+            ket = (r[3] if len(r) > 3 and r[3] not in ("", "-") else
+                   (r[1] if len(r) > 1 else ""))
+            baris_out.append(f"• Rp{nom:,} — {ket}")
+
+    baris_in, total_in = [], 0
+    for r in inc:
+        if r and r[0] and in_range(r[0]):
+            nom = int(re.sub(r"[^\d]", "", str(r[2])) or 0)
+            total_in += nom
+            baris_in.append(f"• Rp{nom:,} — {r[1] if len(r) > 1 else ''}")
+
+    judul = f"📊 Rekap {start}" + (f" s/d {end}" if end != start else "")
+    bagian = [judul, ""]
+    if baris_out:
+        bagian.append(f"📤 Pengeluaran ({len(baris_out)}x) — total Rp{total_out:,}")
+        bagian += baris_out
+    else:
+        bagian.append("📤 Tidak ada pengeluaran.")
+    if baris_in:
+        bagian.append("")
+        bagian.append(f"📥 Pemasukan ({len(baris_in)}x) — total Rp{total_in:,}")
+        bagian += baris_in
+
+    await update.message.reply_text("\n".join(bagian)[:4000])
+
+
+async def rekap(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    periode = " ".join(context.args).strip() or "hari ini"
+    await _proses_rekap(update, periode, update.effective_user.id)
+
+
+# ==========================================
 # HANDLER: foto struk
 # ==========================================
 async def terima_foto(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1335,9 +1458,39 @@ async def terima_foto(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "nominal": nominal,
             "merchant": hasil.get("merchant", "-"),
             "sumber": "Struk",
-            "catatan": (update.message.caption or "").strip(),
+            "catatan": "" if is_pertanyaan_cek(caption) else (update.message.caption or "").strip(),
         }
         token = buat_token(data)
+
+        # Kalau caption berupa pertanyaan "sudah pernah diupload?", cek dulu.
+        if is_pertanyaan_cek(caption):
+            dup = cari_duplikat(get_spreadsheet_id(user_id), data["tanggal"], nominal)
+            if dup:
+                rincian = "\n".join(
+                    f"• {d['kategori']} — {d['merchant'] or '-'}"
+                    + (f" ({d['catatan']})" if d['catatan'] else "")
+                    for d in dup[:5]
+                )
+                await update.message.reply_text(
+                    f"✅ *Sudah pernah dicatat.*\n\n"
+                    f"Ada {len(dup)} transaksi dengan tanggal & nominal sama "
+                    f"(Rp{nominal:,}, {data['tanggal']}):\n{rincian}\n\n"
+                    f"Kalau ini transaksi *berbeda*, kamu tetap bisa menyimpannya:",
+                    parse_mode="Markdown",
+                    reply_markup=keyboard_konfirmasi_struk(token),
+                )
+            else:
+                await update.message.reply_text(
+                    f"🆕 *Belum pernah dicatat.*\n\n"
+                    f"🏪 {data['merchant']}\n"
+                    f"📅 {data['tanggal']}\n"
+                    f"🏷️ {data['kategori']}\n"
+                    f"💰 Rp{nominal:,}\n\n"
+                    f"Mau simpan transaksi ini?",
+                    parse_mode="Markdown",
+                    reply_markup=keyboard_konfirmasi_struk(token),
+                )
+            return
 
         await update.message.reply_text(
             f"📋 *Hasil baca struk:*\n\n"
@@ -1772,6 +1925,7 @@ def main():
     app.add_handler(CommandHandler("dummy", dummy))
     app.add_handler(CommandHandler("hapusdummy", hapusdummy))
     app.add_handler(CommandHandler("tanya", tanya))
+    app.add_handler(CommandHandler("rekap", rekap))
     app.add_handler(CommandHandler("fitur", fitur))
     app.add_handler(CommandHandler("saran", saran))
     app.add_handler(CommandHandler("batal", batal))
