@@ -1347,7 +1347,7 @@ Aturan:
             total_out += nom
             ket = (r[3] if len(r) > 3 and r[3] not in ("", "-") else
                    (r[1] if len(r) > 1 else ""))
-            baris_out.append(f"• Rp{nom:,} — {ket}")
+            baris_out.append(f"• {str(r[0])[:10]} · Rp{nom:,} — {ket}")
 
     # Pemasukan tak punya tipe bayar; sembunyikan kalau user memfilter tipe.
     baris_in, total_in = [], 0
@@ -1356,7 +1356,7 @@ Aturan:
             if r and r[0] and in_range(r[0]):
                 nom = int(re.sub(r"[^\d]", "", str(r[2])) or 0)
                 total_in += nom
-                baris_in.append(f"• Rp{nom:,} — {r[1] if len(r) > 1 else ''}")
+                baris_in.append(f"• {str(r[0])[:10]} · Rp{nom:,} — {r[1] if len(r) > 1 else ''}")
 
     label_tipe = {"paylater": " (Pay Later)", "cash": " (Cash)"}.get(tipe_f, "")
     judul = f"📊 Rekap {start}" + (f" s/d {end}" if end != start else "") + label_tipe
