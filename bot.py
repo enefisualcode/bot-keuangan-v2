@@ -1291,18 +1291,21 @@ async def _proses_rekap(update, periode_teks, user_id):
     prompt = f"""Ubah deskripsi periode ini jadi rentang tanggal. Hari ini {hari_ini}.
 Deskripsi: "{periode_teks}"
 
-Balas HANYA JSON: {{"start":"YYYY-MM-DD","end":"YYYY-MM-DD"}}
+Balas HANYA JSON: {{"start":"YYYY-MM-DD","end":"YYYY-MM-DD","tipe":"paylater / cash / (kosong)"}}
 Aturan:
 - "1 agustus 2026" -> start=end=2026-08-01
 - "hari ini" -> {hari_ini}; "kemarin" -> sehari sebelum {hari_ini}
 - "minggu ini" -> Senin s/d Minggu minggu ini
 - "bulan ini" -> tanggal 1 s/d akhir bulan ini
-- kalau tak jelas, pakai {hari_ini} untuk start & end."""
+- kalau tak jelas, pakai {hari_ini} untuk start & end.
+- "tipe": isi "paylater" kalau user menyebut pay later/paylater/cicilan;
+  "cash"/"tunai" kalau menyebut cash/tunai; selain itu kosongkan ("")."""
     try:
         resp = gemini_model.generate_content(prompt)
         raw = re.sub(r"^```json\s*|\s*```$", "", resp.text.strip()).strip()
         rng = json.loads(raw)
         start, end = rng["start"], rng["end"]
+        tipe_f = (rng.get("tipe") or "").lower().replace(" ", "")
     except Exception as e:
         logger.error(f"parse periode rekap: {e}")
         await update.message.reply_text(
@@ -1327,29 +1330,42 @@ Aturan:
     def in_range(tgl):
         return start <= str(tgl)[:10] <= end
 
+    def cocok_tipe(r):
+        if not tipe_f:
+            return True
+        tv = (r[6].lower() if len(r) > 6 else "")
+        if tipe_f == "paylater":
+            return "paylater" in tv or ("pay" in tv and "later" in tv)
+        if tipe_f == "cash":
+            return "cash" in tv or "tunai" in tv
+        return True
+
     baris_out, total_out = [], 0
     for r in out:
-        if r and r[0] and in_range(r[0]):
+        if r and r[0] and in_range(r[0]) and cocok_tipe(r):
             nom = int(re.sub(r"[^\d]", "", str(r[2])) or 0)
             total_out += nom
             ket = (r[3] if len(r) > 3 and r[3] not in ("", "-") else
                    (r[1] if len(r) > 1 else ""))
             baris_out.append(f"• Rp{nom:,} — {ket}")
 
+    # Pemasukan tak punya tipe bayar; sembunyikan kalau user memfilter tipe.
     baris_in, total_in = [], 0
-    for r in inc:
-        if r and r[0] and in_range(r[0]):
-            nom = int(re.sub(r"[^\d]", "", str(r[2])) or 0)
-            total_in += nom
-            baris_in.append(f"• Rp{nom:,} — {r[1] if len(r) > 1 else ''}")
+    if not tipe_f:
+        for r in inc:
+            if r and r[0] and in_range(r[0]):
+                nom = int(re.sub(r"[^\d]", "", str(r[2])) or 0)
+                total_in += nom
+                baris_in.append(f"• Rp{nom:,} — {r[1] if len(r) > 1 else ''}")
 
-    judul = f"📊 Rekap {start}" + (f" s/d {end}" if end != start else "")
+    label_tipe = {"paylater": " (Pay Later)", "cash": " (Cash)"}.get(tipe_f, "")
+    judul = f"📊 Rekap {start}" + (f" s/d {end}" if end != start else "") + label_tipe
     bagian = [judul, ""]
     if baris_out:
         bagian.append(f"📤 Pengeluaran ({len(baris_out)}x) — total Rp{total_out:,}")
         bagian += baris_out
     else:
-        bagian.append("📤 Tidak ada pengeluaran.")
+        bagian.append("📤 Tidak ada pengeluaran" + (label_tipe or "") + ".")
     if baris_in:
         bagian.append("")
         bagian.append(f"📥 Pemasukan ({len(baris_in)}x) — total Rp{total_in:,}")
