@@ -29,7 +29,12 @@ from datetime import datetime
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import google.generativeai as genai
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -700,6 +705,17 @@ def pesan_cara_manual():
 # ==========================================
 # HANDLER: /start
 # ==========================================
+def keyboard_utama():
+    return ReplyKeyboardMarkup(
+        [
+            ["📝 Catat", "📊 Rekap Hari Ini"],
+            ["🤖 Tanya AI", "📈 Dashboard"],
+            ["✨ Fitur", "💡 Saran"],
+        ],
+        resize_keyboard=True,
+    )
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not get_spreadsheet_id(user_id):
@@ -716,10 +732,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "`/masuk 5000000 Gaji bulan ini`\n\n"
         "3️⃣ *Dari struk*\n"
         "Kirim foto struk, saya baca otomatis. Kirim satu foto per struk.\n\n"
-        "ℹ️ `/info` lihat spreadsheet yang terhubung\n"
-        "🧪 `/dummy` isi data contoh untuk mencoba Dashboard\n"
-        "🧹 `/hapusdummy` hapus lagi data contoh itu",
+        "Gunakan *tombol di bawah* untuk akses cepat 👇",
         parse_mode="Markdown",
+        reply_markup=keyboard_utama(),
     )
 
 
@@ -789,6 +804,7 @@ async def _proses_daftar(update, spreadsheet_id, user):
         f"📊 Dashboard akan terisi sendiri begitu ada transaksi.\n\n"
         f"Coba sekarang:\n`/catat 15000 Makan nasi goreng`",
         parse_mode="Markdown",
+        reply_markup=keyboard_utama(),
     )
 
 
@@ -897,13 +913,50 @@ async def terima_teks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(pesan_belum_daftar(), parse_mode="Markdown")
         return
 
-    # 4. Terdaftar -> query rekap atau catat belanja
-    if teks:
-        low = teks.lower()
-        if low.startswith(("transaksi", "rekap", "laporan", "riwayat", "lihat")):
-            await _proses_rekap(update, teks, user_id)
-        else:
-            await _proses_teks_belanja(update, teks, user_id)
+    # 4. Terdaftar -> tombol keyboard, query rekap, atau catat belanja
+    if not teks:
+        return
+
+    # Tombol keyboard utama
+    if teks == "📊 Rekap Hari Ini":
+        await _proses_rekap(update, "hari ini", user_id)
+        return
+    if teks == "✨ Fitur":
+        await update.message.reply_text(TEKS_FITUR, parse_mode="Markdown")
+        return
+    if teks == "📈 Dashboard":
+        await info(update, context)
+        return
+    if teks == "💡 Saran":
+        menunggu_saran.add(user_id)
+        await update.message.reply_text(
+            "💡 Silakan kirim saranmu — boleh *teks*, atau *foto beserta caption*.\n"
+            "Ketik /batal untuk membatalkan.",
+            parse_mode="Markdown",
+        )
+        return
+    if teks == "🤖 Tanya AI":
+        await update.message.reply_text(
+            "Ketik pertanyaanmu, contoh:\n"
+            "`/tanya berapa kali saya ngopi minggu ini`\n"
+            "`/tanya beri saran biar lebih hemat`",
+            parse_mode="Markdown",
+        )
+        return
+    if teks == "📝 Catat":
+        await update.message.reply_text(
+            "Ketik pengeluaranmu langsung, contoh:\n"
+            "\"jajan bakso 20rb di warung Ali\"\n"
+            "atau `/catat 20000 Makan bakso`",
+            parse_mode="Markdown",
+        )
+        return
+
+    low = teks.lower()
+    if low.startswith(("transaksi", "rekap", "laporan", "riwayat", "lihat")):
+        await _proses_rekap(update, teks, user_id)
+    else:
+        await _proses_teks_belanja(update, teks, user_id)
 
 
 async def _proses_teks_belanja(update, teks, user_id):
@@ -1756,16 +1809,24 @@ TEKS_FITUR = (
     "✨ *Fitur bot ini:*\n\n"
     "📝 *Catat pengeluaran*\n"
     "`/catat 50000 Makan nasi goreng`\n"
-    "• Tambah *note* pakai `;` → `/catat 50000 Makan ; ditalangin, tagih Andi`\n"
+    "• Note pribadi pakai `;` → `/catat 50000 Makan ; ditalangin, tagih Andi`\n"
     "• Ketik *kemarin* untuk tanggal kemarin → `/catat 20000 Kopi kemarin`\n\n"
+    "⚡ *Catat tanpa perintah*\n"
+    "Ketik biasa seperti ngobrol, mis. \"jajan bakso 20rb di warung Ali\" — "
+    "AI otomatis paham nominal, kategori, & barangnya.\n\n"
     "💵 *Catat pemasukan*\n"
     "`/masuk 5000000 Gaji`\n\n"
     "📸 *Foto struk otomatis*\n"
-    "Kirim foto struk, dibaca sendiri. *Caption foto* jadi catatannya.\n\n"
+    "Kirim foto struk, dibaca sendiri (termasuk daftar barang).\n"
+    "• *Caption* jadi catatan.\n"
+    "• Caption berupa pertanyaan (mis. \"sudah pernah diupload?\") → bot cek duplikat dulu.\n\n"
+    "📊 *Rekap transaksi*\n"
+    "`/rekap hari ini` · `/rekap 1 agustus 2026` · `/rekap bulan ini`\n"
+    "• Bisa disaring tipe bayar → \"rekap bulan ini paylater\"\n\n"
     "🤖 *Tanya AI* soal keuanganmu\n"
     "`/tanya berapa kali saya ngopi minggu ini`\n"
     "`/tanya beri saran biar lebih hemat`\n\n"
-    "📊 *Dashboard web* — ringkasan, grafik, Total Pay Later per periode.\n"
+    "📈 *Dashboard web* — ringkasan, grafik, Total Pay Later per periode.\n"
     "Lihat spreadsheet & dashboard: `/info`\n\n"
     "💡 *Punya saran?* Kirim ke developer dengan `/saran`\n"
     "(boleh teks, atau foto beserta caption)."
