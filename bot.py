@@ -24,7 +24,7 @@ import re
 import os
 import uuid
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
@@ -80,6 +80,15 @@ HEADER_PENGELUARAN = ["Tanggal", "Kategori", "Nominal", "Merchant",
                       "Sumber", "Catatan", "Tipe Bayar", "Barang"]
 HEADER_PEMASUKAN = ["Tanggal", "Kategori", "Nominal", "Sumber", "Catatan"]
 HEADER_USERS = ["user_id", "username", "spreadsheet_id", "tanggal_daftar"]
+
+# ==========================================
+# WAKTU: selalu pakai WIB (server Railway pakai UTC)
+# ==========================================
+WIB = timezone(timedelta(hours=7))
+
+
+def now_wib():
+    return datetime.now(WIB)
 
 # ==========================================
 # KATEGORI BAKU + normalisasi
@@ -578,7 +587,7 @@ def simpan_user(user_id, username, spreadsheet_id):
         cell = ws.find(uid, in_column=1)
     except Exception:
         cell = None
-    tgl = datetime.now().strftime("%Y-%m-%d %H:%M")
+    tgl = now_wib().strftime("%Y-%m-%d %H:%M")
     if cell:
         ws.update(
             f"A{cell.row}:D{cell.row}",
@@ -642,10 +651,25 @@ def buat_token(data):
 # KEYBOARD
 # ==========================================
 def keyboard_tipe_bayar(token):
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("💵 Cash", callback_data=f"bayar_cash|{token}"),
-        InlineKeyboardButton("💳 Pay Later", callback_data=f"bayar_paylater|{token}"),
-    ]])
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("💵 Cash", callback_data=f"bayar_cash|{token}"),
+            InlineKeyboardButton("💳 Pay Later", callback_data=f"bayar_paylater|{token}"),
+        ],
+        [InlineKeyboardButton("✏️ Ganti Kategori", callback_data=f"editkat|{token}")],
+    ])
+
+
+def keyboard_pilih_kategori(token):
+    baris, row = [], []
+    for i, k in enumerate(KATEGORI_BAKU):
+        row.append(InlineKeyboardButton(k, callback_data=f"setkat_{i}|{token}"))
+        if len(row) == 2:
+            baris.append(row)
+            row = []
+    if row:
+        baris.append(row)
+    return InlineKeyboardMarkup(baris)
 
 
 def keyboard_konfirmasi_struk(token):
@@ -961,7 +985,7 @@ async def terima_teks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _proses_teks_belanja(update, teks, user_id):
     """Urai kalimat bebas (mis. 'jajan bakso 20rb di warung Ali') jadi transaksi."""
-    hari_ini = datetime.now().strftime("%Y-%m-%d")
+    hari_ini = now_wib().strftime("%Y-%m-%d")
     prompt = f"""Ubah kalimat belanja berikut jadi JSON. Hari ini {hari_ini}.
 Kalimat: "{teks}"
 
@@ -1052,7 +1076,7 @@ async def info(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==========================================
 def _tanggal_periode(offset_hari):
     from datetime import timedelta
-    return (datetime.now() - timedelta(days=offset_hari)).strftime("%Y-%m-%d")
+    return (now_wib() - timedelta(days=offset_hari)).strftime("%Y-%m-%d")
 
 
 DUMMY_PENGELUARAN = [
@@ -1177,7 +1201,7 @@ def tanggal_dari_kata(tokens):
             continue
         bersih.append(tokens[i])
         i += 1
-    tgl = (datetime.now() - timedelta(days=offset)).strftime("%Y-%m-%d")
+    tgl = (now_wib() - timedelta(days=offset)).strftime("%Y-%m-%d")
     return tgl, bersih
 
 
@@ -1298,6 +1322,50 @@ async def catat_masuk(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ==========================================
+# HANDLER: /hapus (hapus transaksi pengeluaran terakhir)
+# ==========================================
+async def hapus(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    sid = get_spreadsheet_id(user_id)
+    if not sid:
+        await update.message.reply_text(pesan_belum_daftar(), parse_mode="Markdown")
+        return
+
+    try:
+        ws = get_client().open_by_key(sid).worksheet(SHEET_PENGELUARAN)
+        nilai = ws.get_all_values()
+    except Exception as e:
+        logger.error(f"hapus baca sheet {user_id}: {e}")
+        await update.message.reply_text("❌ Gagal membaca data.")
+        return
+
+    idx, baris = None, None
+    for i in range(len(nilai) - 1, 0, -1):   # lewati header (baris 1)
+        if nilai[i] and nilai[i][0]:
+            idx, baris = i + 1, nilai[i]     # idx 1-based untuk delete_rows
+            break
+
+    if not idx:
+        await update.message.reply_text("Belum ada pengeluaran untuk dihapus.")
+        return
+
+    token = buat_token({"user_id": user_id, "hapus_row": idx})
+    nom = re.sub(r"[^\d]", "", str(baris[2])) if len(baris) > 2 else "0"
+    await update.message.reply_text(
+        f"🗑️ *Hapus pengeluaran terakhir ini?*\n\n"
+        f"📅 {baris[0]}\n"
+        f"🏷️ {baris[1] if len(baris) > 1 else '-'}\n"
+        f"💰 Rp{int(nom or 0):,}\n"
+        f"🏪 {baris[3] if len(baris) > 3 else '-'}",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🗑️ Ya, hapus", callback_data=f"hapus_ya|{token}"),
+            InlineKeyboardButton("❌ Batal", callback_data=f"hapus_batal|{token}"),
+        ]]),
+    )
+
+
+# ==========================================
 # Cek duplikat & rekap transaksi
 # ==========================================
 def is_pertanyaan_cek(caption):
@@ -1340,7 +1408,7 @@ async def _proses_rekap(update, periode_teks, user_id):
         await update.message.reply_text(pesan_belum_daftar(), parse_mode="Markdown")
         return
 
-    hari_ini = datetime.now().strftime("%Y-%m-%d")
+    hari_ini = now_wib().strftime("%Y-%m-%d")
     prompt = f"""Ubah deskripsi periode ini jadi rentang tanggal. Hari ini {hari_ini}.
 Deskripsi: "{periode_teks}"
 
@@ -1454,7 +1522,7 @@ async def terima_foto(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text("📸 Struk diterima, sedang dibaca...")
-    hari_ini = datetime.now().strftime("%Y-%m-%d")
+    hari_ini = now_wib().strftime("%Y-%m-%d")
 
     try:
         photo_file = await update.message.photo[-1].get_file()
@@ -1603,6 +1671,47 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user_id = data["user_id"]
+
+    # --- Hapus transaksi terakhir ---
+    if aksi == "hapus_batal":
+        pending.pop(token, None)
+        await query.edit_message_text("Dibatalkan. Transaksi tidak jadi dihapus.")
+        return
+    if aksi == "hapus_ya":
+        try:
+            ws = get_client().open_by_key(get_spreadsheet_id(user_id)).worksheet(SHEET_PENGELUARAN)
+            ws.delete_rows(int(data["hapus_row"]))
+            pending.pop(token, None)
+            await query.edit_message_text("🗑️ Transaksi terakhir sudah dihapus.")
+        except Exception as e:
+            logger.error(f"Gagal hapus transaksi {user_id}: {e}")
+            await query.edit_message_text("❌ Gagal menghapus. Coba lagi sebentar.")
+        return
+
+    # --- Ganti kategori sebelum simpan ---
+    if aksi == "editkat":
+        await query.edit_message_text(
+            f"Pilih kategori baru untuk pengeluaran Rp{data['nominal']:,}:",
+            reply_markup=keyboard_pilih_kategori(token),
+        )
+        return
+    if aksi.startswith("setkat_"):
+        try:
+            data["kategori"] = KATEGORI_BAKU[int(aksi.replace("setkat_", ""))]
+        except (ValueError, IndexError):
+            pass
+        await query.edit_message_text(
+            f"📋 *Detail Pengeluaran:*\n\n"
+            f"🏪 Merchant: {data.get('merchant', '-')}\n"
+            f"📅 Tanggal: {data['tanggal']}\n"
+            f"🏷️ Kategori: {data['kategori']}\n"
+            f"🛒 Barang: {data.get('barang') or '-'}\n"
+            f"💰 Nominal: Rp{data['nominal']:,}\n\n"
+            f"Pilih tipe pembayaran:",
+            parse_mode="Markdown",
+            reply_markup=keyboard_tipe_bayar(token),
+        )
+        return
 
     # --- Batal ---
     if aksi == "struk_batal":
@@ -1766,7 +1875,7 @@ async def tanya(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Belum ada transaksi untuk dianalisis.")
             return
 
-        hari_ini = datetime.now().strftime("%Y-%m-%d")
+        hari_ini = now_wib().strftime("%Y-%m-%d")
         prompt = f"""Kamu asisten keuangan pribadi. Hari ini {hari_ini}.
 Di bawah ini data transaksi user, satu baris per transaksi dengan format:
 tanggal|OUT/IN|kategori|nominal|merchant|catatan|tipe_bayar
@@ -1943,7 +2052,7 @@ async def statususer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Gagal membaca daftar user.")
         return
 
-    hari_ini = datetime.now().date()
+    hari_ini = now_wib().date()
     baris = []
     aktif = 0
     for rec in records:
@@ -1999,6 +2108,7 @@ def main():
     app.add_handler(CommandHandler("info", info))
     app.add_handler(CommandHandler("catat", catat_manual))
     app.add_handler(CommandHandler("masuk", catat_masuk))
+    app.add_handler(CommandHandler("hapus", hapus))
     app.add_handler(CommandHandler("dummy", dummy))
     app.add_handler(CommandHandler("hapusdummy", hapusdummy))
     app.add_handler(CommandHandler("tanya", tanya))
