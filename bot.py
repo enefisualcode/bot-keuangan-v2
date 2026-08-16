@@ -93,7 +93,7 @@ def now_wib():
 # ==========================================
 # KATEGORI BAKU + normalisasi
 # ==========================================
-KATEGORI_BAKU = ["Makan", "Ngopi", "Transport", "Belanja",
+KATEGORI_BAKU = ["Makan", "Donasi", "Transport", "Belanja",
                  "Hiburan", "Tagihan", "Investasi", "Lainnya"]
 
 # Kata kunci -> kategori. Dicocokkan ke gabungan (kategori + merchant), huruf kecil.
@@ -117,14 +117,17 @@ PETA_KATEGORI = {
                 "shopee", "lazada", "tokped", "skintific", "pinzy", "jastip",
                 "store", "mart", "market", "supermarket", "hypermart", "watsons",
                 "guardian", "pinzy"],
-    "Ngopi": ["kopi", "coffee", "fore", "kenangan", "starbucks", "janji jiwa",
-              "point coffee", "tuku", "juice", "jus", "boba", "milk tea",
-              "es teh", "ngopi"],
+    "Donasi": ["donasi", "sedekah", "shodaqoh", "zakat", "infaq", "infak",
+               "wakaf", "sumbangan", "amal", "kurban", "qurban", "kitabisa",
+               "dompet dhuafa", "rumah zakat", "baznas", "yatim", "charity"],
     "Makan": ["makan", "warteg", "nasi", "ayam", "bakso", "mie", "sushi",
               "gorengan", "cimol", "gado", "kebab", "roti", "kantin", "warung",
               "resto", "food", "seblak", "telor", "telur", "jajan", "snack",
               "martabak", "sate", "soto", "padang", "geprek", "burger", "pizza",
-              "kfc", "mcd", "richeese", "dimsum", "hachi", "kabobs", "goreng"],
+              "kfc", "mcd", "richeese", "dimsum", "hachi", "kabobs", "goreng",
+              "kopi", "coffee", "fore", "kenangan", "starbucks", "janji jiwa",
+              "point coffee", "tuku", "juice", "jus", "boba", "milk tea",
+              "es teh", "ngopi"],
 }
 
 
@@ -990,7 +993,7 @@ async def _proses_teks_belanja(update, teks, user_id):
 Kalimat: "{teks}"
 
 Balas HANYA JSON, tanpa markdown, bentuk:
-{{"nominal": angka_tanpa_titik, "kategori": "salah satu dari: Makan, Ngopi, Transport, Belanja, Hiburan, Tagihan, Investasi, Lainnya", "merchant": "nama toko/tempat atau '-'", "items": "daftar barang pisah koma atau ''"}}
+{{"nominal": angka_tanpa_titik, "kategori": "salah satu dari: Makan, Donasi, Transport, Belanja, Hiburan, Tagihan, Investasi, Lainnya", "merchant": "nama toko/tempat atau '-'", "items": "daftar barang pisah koma atau ''"}}
 
 Aturan:
 - nominal rupiah: "20rb"/"20 ribu" = 20000, "1,5jt"/"1.5 juta" = 1500000.
@@ -1541,12 +1544,12 @@ async def terima_foto(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "tanggal": "YYYY-MM-DD (kalau tidak jelas gunakan {hari_ini})",
             "nominal": angka_total_tanpa_titik_atau_koma,
             "items": "daftar barang yang dibeli, pisahkan dengan koma (kalau tidak jelas isi '')",
-            "kategori": "WAJIB pilih SATU dari: Makan, Ngopi, Transport, Belanja, Hiburan, Tagihan, Investasi, Lainnya"
+            "kategori": "WAJIB pilih SATU dari: Makan, Donasi, Transport, Belanja, Hiburan, Tagihan, Investasi, Lainnya"
         }}
 
         Panduan memilih kategori (tebak dari nama merchant/isi struk):
-        - Makan: makanan (warteg, kebab, bakso, sushi, gorengan, gado-gado, dll)
-        - Ngopi: kopi & minuman (Fore, Kopi Kenangan, juice, boba)
+        - Makan: makanan & minuman (warteg, kebab, bakso, kopi, Fore, juice, boba)
+        - Donasi: sedekah, zakat, infaq, wakaf, sumbangan, kurban, amal
         - Transport: bensin/SPBU, parkir, ojek online, KRL/MRT, tol
         - Belanja: minimarket & toko online (Alfamart, Tokopedia, Shopee, Skintific, jastip)
         - Hiburan: warnet/game center, bioskop, langganan hiburan
