@@ -988,9 +988,13 @@ async def terima_teks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _proses_teks_belanja(update, teks, user_id):
     """Urai kalimat bebas (mis. 'jajan bakso 20rb di warung Ali') jadi transaksi."""
+    # Deteksi 'kemarin'/'kemarin lusa' dulu, lalu buang kata waktunya
+    # supaya tidak ikut mengganggu parser.
+    tanggal, sisa_tok = tanggal_dari_kata(teks.split())
+    teks_bersih = " ".join(sisa_tok) or teks
     hari_ini = now_wib().strftime("%Y-%m-%d")
     prompt = f"""Ubah kalimat belanja berikut jadi JSON. Hari ini {hari_ini}.
-Kalimat: "{teks}"
+Kalimat: "{teks_bersih}"
 
 Balas HANYA JSON, tanpa markdown, bentuk:
 {{"nominal": angka_tanpa_titik, "kategori": "salah satu dari: Makan, Donasi, Transport, Belanja, Hiburan, Tagihan, Investasi, Lainnya", "merchant": "nama toko/tempat atau '-'", "items": "daftar barang pisah koma atau ''"}}
@@ -1032,7 +1036,7 @@ Aturan:
     data = {
         "user_id": user_id,
         "jenis": "pengeluaran",
-        "tanggal": hari_ini,
+        "tanggal": tanggal,
         "kategori": kategori,
         "nominal": nominal,
         "merchant": (hasil.get("merchant") or "-").strip() or "-",
