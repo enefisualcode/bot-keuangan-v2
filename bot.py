@@ -688,6 +688,14 @@ def keyboard_konfirmasi_struk(token):
     ]])
 
 
+def keyboard_struk_tanggal_tua(token):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Tanggal benar, simpan", callback_data=f"struk_simpan|{token}")],
+        [InlineKeyboardButton("📅 Ganti ke hari ini", callback_data=f"struk_hariini|{token}")],
+        [InlineKeyboardButton("❌ Batal", callback_data=f"struk_batal|{token}")],
+    ])
+
+
 KATEGORI_MASUK = {
     "gaji": "💼 Gaji/Tunjangan",
     "freelance": "💸 Freelance",
@@ -1208,6 +1216,16 @@ def tanggal_struk_valid(tgl_str, hari_ini):
     return d.strftime("%Y-%m-%d")
 
 
+def tanggal_terlalu_tua(tgl_str, hari_ini, batas=45):
+    """True kalau tanggal struk lebih dari `batas` hari lampau (kemungkinan salah baca bulan)."""
+    try:
+        d = datetime.strptime(str(tgl_str)[:10], "%Y-%m-%d").date()
+        ini = datetime.strptime(hari_ini, "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        return False
+    return (ini - d).days > batas
+
+
 def tanggal_dari_kata(tokens):
     """Deteksi kata waktu di antara tokens dan buang katanya.
     Kembalikan (tanggal 'YYYY-MM-DD', tokens_bersih).
@@ -1658,6 +1676,21 @@ async def terima_foto(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             return
 
+        if tanggal_terlalu_tua(data["tanggal"], hari_ini):
+            await update.message.reply_text(
+                f"⚠️ *Cek tanggal dulu.*\n"
+                f"Struk ini terbaca bertanggal *{data['tanggal']}* — "
+                f"sudah lebih dari 45 hari lalu. Bisa jadi salah baca.\n\n"
+                f"🏪 Merchant: {data['merchant']}\n"
+                f"🏷️ Kategori: {data['kategori']}\n"
+                f"💰 Nominal: Rp{nominal:,}\n"
+                f"📝 Catatan: {data['catatan'] or '-'}\n\n"
+                f"Tanggalnya benar, atau ganti ke hari ini?",
+                parse_mode="Markdown",
+                reply_markup=keyboard_struk_tanggal_tua(token),
+            )
+            return
+
         await update.message.reply_text(
             f"📋 *Hasil baca struk:*\n\n"
             f"🏪 Merchant: {data['merchant']}\n"
@@ -1743,6 +1776,21 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # --- Batal ---
+    if aksi == "struk_hariini":
+        data["tanggal"] = now_wib().strftime("%Y-%m-%d")
+        await query.edit_message_text(
+            f"📋 *Hasil baca struk:* (tanggal diganti ke hari ini)\n\n"
+            f"🏪 Merchant: {data['merchant']}\n"
+            f"📅 Tanggal: {data['tanggal']}\n"
+            f"🏷️ Kategori: {data['kategori']}\n"
+            f"💰 Nominal: Rp{data['nominal']:,}\n"
+            f"📝 Catatan: {data.get('catatan') or '-'}\n\n"
+            f"Simpan data ini?",
+            parse_mode="Markdown",
+            reply_markup=keyboard_konfirmasi_struk(token),
+        )
+        return
+
     if aksi == "struk_batal":
         pending.pop(token, None)
         await query.edit_message_text("❌ Dibatalkan, data tidak disimpan.")
