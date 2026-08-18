@@ -1186,6 +1186,22 @@ async def hapusdummy(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==========================================
 # HANDLER: /catat
 # ==========================================
+def tanggal_struk_valid(tgl_str, hari_ini):
+    """Struk tidak mungkin bertanggal di masa depan; tolak tahun ngawur.
+    Kalau tanggal OCR di masa depan atau >1 tahun lampau, pakai hari ini."""
+    try:
+        d = datetime.strptime(str(tgl_str)[:10], "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        return hari_ini
+    try:
+        ini = datetime.strptime(hari_ini, "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        return hari_ini
+    if d > ini or d.year < ini.year - 1:
+        return hari_ini
+    return d.strftime("%Y-%m-%d")
+
+
 def tanggal_dari_kata(tokens):
     """Deteksi kata waktu di antara tokens dan buang katanya.
     Kembalikan (tanggal 'YYYY-MM-DD', tokens_bersih).
@@ -1592,7 +1608,7 @@ async def terima_foto(update: Update, context: ContextTypes.DEFAULT_TYPE):
         data = {
             "user_id": user_id,
             "jenis": "pengeluaran",
-            "tanggal": hasil.get("tanggal") or hari_ini,
+            "tanggal": tanggal_struk_valid(hasil.get("tanggal"), hari_ini),
             "kategori": normalkan_kategori(
                 hasil.get("kategori", "Lainnya"),
                 hasil.get("merchant", ""),
