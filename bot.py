@@ -263,8 +263,14 @@ def _isi_dashboard(ws, sep, colsep):
             '=SUMIF($L$2:$L$5000~$K$1~' + P + '!$C$2:$C$5000)')]]},
         {"range": "B5", "values": [["=B3-B4"]]},
         {"range": "B6", "values": [[f(
-            '=IFERROR(B4/COUNTA(UNIQUE(FILTER(' + P + '!$A$2:$A$5000~'
-            '$L$2:$L$5000=$K$1)))~0)')]]},
+            '=IFERROR(B4/COUNTA(UNIQUE(FILTER(' + P + '!$A$2:$A~'
+            '(' + P + '!$A$2:$A>=IF(DAY(TODAY())>=25~'
+            'DATE(YEAR(TODAY())~MONTH(TODAY())~25)~'
+            'DATE(YEAR(TODAY())~MONTH(TODAY())-1~25)))*'
+            '(' + P + '!$A$2:$A<=IF(DAY(TODAY())>=25~'
+            'DATE(YEAR(TODAY())~MONTH(TODAY())+1~24)~'
+            'DATE(YEAR(TODAY())~MONTH(TODAY())~24)))'
+            ')))~0)')]]},
 
         # --- Blok pengeluaran per kategori (A8:B) ---
         {"range": "A8", "values": [["  PENGELUARAN PER KATEGORI"]]},
