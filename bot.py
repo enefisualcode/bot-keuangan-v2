@@ -252,9 +252,10 @@ def _isi_dashboard(ws, sep, colsep):
     ws.batch_update([
         # --- Blok ringkasan (A:B) ---
         {"range": "A1", "values": [["  RINGKASAN PERIODE BERJALAN"]]},
-        {"range": "A2:A6", "values": [
+        {"range": "A2:A8", "values": [
             ["Periode"], ["Total Pemasukan"], ["Total Pengeluaran"],
             ["Selisih"], ["Rata-rata Harian"],
+            ["Total Investasi"], ["Investasi Kumulatif"],
         ]},
         {"range": "B2", "values": [[f(T_LABEL_PERIODE)]]},
         {"range": "B3", "values": [[f(
@@ -271,16 +272,27 @@ def _isi_dashboard(ws, sep, colsep):
             'DATE(YEAR(TODAY())~MONTH(TODAY())+1~24)~'
             'DATE(YEAR(TODAY())~MONTH(TODAY())~24)))'
             ')))~0)')]]},
+        {"range": "B7", "values": [[f(
+            '=SUMPRODUCT((' + P + '!$B$2:$B="Investasi")*'
+            '(' + P + '!$A$2:$A>=IF(DAY(TODAY())>=25~'
+            'DATE(YEAR(TODAY())~MONTH(TODAY())~25)~'
+            'DATE(YEAR(TODAY())~MONTH(TODAY())-1~25)))*'
+            '(' + P + '!$A$2:$A<=IF(DAY(TODAY())>=25~'
+            'DATE(YEAR(TODAY())~MONTH(TODAY())+1~24)~'
+            'DATE(YEAR(TODAY())~MONTH(TODAY())~24)))*'
+            + P + '!$C$2:$C)')]]},
+        {"range": "B8", "values": [[f(
+            '=SUMIF(' + P + '!$B$2:$B~"Investasi"~' + P + '!$C$2:$C)')]]},
 
-        # --- Blok pengeluaran per kategori (A8:B) ---
-        {"range": "A8", "values": [["  PENGELUARAN PER KATEGORI"]]},
-        {"range": "A9:B9", "values": [["Kategori", "Total"]]},
-        {"range": "A10", "values": [[f(
+        # --- Blok pengeluaran per kategori (A10:B) ---
+        {"range": "A10", "values": [["  PENGELUARAN PER KATEGORI"]]},
+        {"range": "A11:B11", "values": [["Kategori", "Total"]]},
+        {"range": "A12", "values": [[f(
             '=IFERROR(SORT(UNIQUE(FILTER($N$2:$N$5000~'
             '$N$2:$N$5000<>""))~1~TRUE)~"")')]]},
-        {"range": "B10", "values": [[f(
-            '=ARRAYFORMULA(IF($A$10:$A$40=""~""~'
-            'SUMIF($N$2:$N$5000~$A$10:$A$40~'
+        {"range": "B12", "values": [[f(
+            '=ARRAYFORMULA(IF($A$12:$A$42=""~""~'
+            'SUMIF($N$2:$N$5000~$A$12:$A$42~'
             + P + '!$C$2:$C$5000)))')]]},
 
         # --- Blok rekap harian (D:E) ---
@@ -341,13 +353,13 @@ def _rapikan_dashboard(ss, ws):
         repeat(rng(0, 0, 1, 2), judul, "userEnteredFormat"),
         repeat(rng(0, 3, 1, 5), judul, "userEnteredFormat"),
         repeat(rng(0, 6, 1, 9), judul, "userEnteredFormat"),
-        {"mergeCells": {"range": rng(7, 0, 8, 2), "mergeType": "MERGE_ALL"}},
-        repeat(rng(7, 0, 8, 2), judul, "userEnteredFormat"),
-        repeat(rng(8, 0, 9, 2), tebal, "userEnteredFormat"),
-        repeat(rng(9, 1, 40, 2), angka, "userEnteredFormat.numberFormat"),
+        {"mergeCells": {"range": rng(9, 0, 10, 2), "mergeType": "MERGE_ALL"}},
+        repeat(rng(9, 0, 10, 2), judul, "userEnteredFormat"),
+        repeat(rng(10, 0, 11, 2), tebal, "userEnteredFormat"),
+        repeat(rng(11, 1, 42, 2), angka, "userEnteredFormat.numberFormat"),
         repeat(rng(1, 3, 2, 5), tebal, "userEnteredFormat"),
         repeat(rng(1, 6, 2, 9), tebal, "userEnteredFormat"),
-        repeat(rng(2, 1, 6, 2), angka, "userEnteredFormat.numberFormat"),
+        repeat(rng(2, 1, 8, 2), angka, "userEnteredFormat.numberFormat"),
         repeat(rng(2, 3, 300, 4),
                {"numberFormat": {"type": "DATE",
                                  "pattern": "ddd, dd mmm yyyy"}},
