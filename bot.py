@@ -703,7 +703,9 @@ def keyboard_konfirmasi_struk(token):
 def keyboard_struk_tanggal_tua(token):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Tanggal benar, simpan", callback_data=f"struk_simpan|{token}")],
-        [InlineKeyboardButton("📅 Ganti ke hari ini", callback_data=f"struk_hariini|{token}")],
+        [InlineKeyboardButton("📅 Hari ini", callback_data=f"struk_hariini|{token}"),
+         InlineKeyboardButton("📅 Kemarin", callback_data=f"struk_kemarin|{token}")],
+        [InlineKeyboardButton("✏️ Ketik tanggal lain", callback_data=f"struk_tglmanual|{token}")],
         [InlineKeyboardButton("❌ Batal", callback_data=f"struk_batal|{token}")],
     ])
 
@@ -947,6 +949,36 @@ async def terima_teks(update: Update, context: ContextTypes.DEFAULT_TYPE):
        4) sudah daftar -> coba pahami sebagai pencatatan belanja bebas."""
     user_id = update.effective_user.id
     teks = (update.message.text or "").strip()
+
+    # 0. Sedang mode ketik tanggal manual (dari peringatan struk tanggal-tua)?
+    if user_id in menunggu_tanggal:
+        token = menunggu_tanggal.pop(user_id)
+        data = pending.get(token)
+        if not data:
+            await update.message.reply_text("Sesi ini sudah kedaluwarsa, kirim ulang strukmu ya.")
+            return
+        try:
+            tgl = datetime.strptime(teks, "%Y-%m-%d").strftime("%Y-%m-%d")
+        except ValueError:
+            menunggu_tanggal[user_id] = token   # tetap menunggu, minta ulang
+            await update.message.reply_text(
+                "⚠️ Formatnya harus `YYYY-MM-DD`, contoh `2026-08-20`. Coba lagi:",
+                parse_mode="Markdown",
+            )
+            return
+        data["tanggal"] = tgl
+        await update.message.reply_text(
+            f"📋 *Hasil baca struk:* (tanggal diganti ke {tgl})\n\n"
+            f"🏪 Merchant: {data.get('merchant','-')}\n"
+            f"📅 Tanggal: {tgl}\n"
+            f"🏷️ Kategori: {data.get('kategori','-')}\n"
+            f"💰 Nominal: Rp{data['nominal']:,}\n"
+            f"📝 Catatan: {data.get('catatan') or '-'}\n\n"
+            f"Simpan data ini?",
+            parse_mode="Markdown",
+            reply_markup=keyboard_konfirmasi_struk(token),
+        )
+        return
 
     # 1. Sedang mode saran?
     if user_id in menunggu_saran:
@@ -1787,7 +1819,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # --- Batal ---
+    # --- Ganti tanggal (dari peringatan tanggal-tua) ---
     if aksi == "struk_hariini":
         data["tanggal"] = now_wib().strftime("%Y-%m-%d")
         await query.edit_message_text(
@@ -1803,7 +1835,32 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if aksi == "struk_batal":
+    if aksi == "struk_kemarin":
+        data["tanggal"] = (now_wib() - timedelta(days=1)).strftime("%Y-%m-%d")
+        await query.edit_message_text(
+            f"📋 *Hasil baca struk:* (tanggal diganti ke kemarin)\n\n"
+            f"🏪 Merchant: {data['merchant']}\n"
+            f"📅 Tanggal: {data['tanggal']}\n"
+            f"🏷️ Kategori: {data['kategori']}\n"
+            f"💰 Nominal: Rp{data['nominal']:,}\n"
+            f"📝 Catatan: {data.get('catatan') or '-'}\n\n"
+            f"Simpan data ini?",
+            parse_mode="Markdown",
+            reply_markup=keyboard_konfirmasi_struk(token),
+        )
+        return
+
+    if aksi == "struk_tglmanual":
+        menunggu_tanggal[user_id] = token
+        await query.edit_message_text(
+            "✏️ Ketik tanggal struk yang benar, format `YYYY-MM-DD`.\n"
+            "Contoh: `2026-08-20`\n\n"
+            "Ketik /batal untuk membatalkan.",
+            parse_mode="Markdown",
+        )
+        return
+
+    # --- Batal ---
         pending.pop(token, None)
         await query.edit_message_text("❌ Dibatalkan, data tidak disimpan.")
         return
@@ -2074,6 +2131,7 @@ async def umumkan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # /saran — user kirim masukan ke developer
 # ==========================================
 menunggu_saran = set()   # user_id yang sedang diminta mengetik saran
+menunggu_tanggal = {}    # user_id -> token, sedang diminta mengetik tanggal struk
 
 
 async def _teruskan_saran(update, context, teks="", photo_id=None):
@@ -2118,8 +2176,12 @@ async def saran(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def batal(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id in menunggu_saran:
-        menunggu_saran.discard(update.effective_user.id)
+    uid = update.effective_user.id
+    if uid in menunggu_saran:
+        menunggu_saran.discard(uid)
+        await update.message.reply_text("Dibatalkan. 👍")
+    elif uid in menunggu_tanggal:
+        menunggu_tanggal.pop(uid, None)
         await update.message.reply_text("Dibatalkan. 👍")
     else:
         await update.message.reply_text("Tidak ada yang perlu dibatalkan.")
