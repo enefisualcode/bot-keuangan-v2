@@ -1613,19 +1613,56 @@ async def terima_foto(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text("📸 Struk diterima, sedang dibaca...")
+    photo_file = await update.message.photo[-1].get_file()
+    photo_bytes = await photo_file.download_as_bytearray()
+    await proses_struk(update, context, bytes(photo_bytes), "image/jpeg", caption)
+
+
+async def terima_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    doc = update.message.document
+    caption = (update.message.caption or "").strip()
+
+    # PDF sebagai lampiran SARAN, sama seperti alur foto.
+    if user_id in menunggu_saran or caption.lower().startswith("/saran"):
+        menunggu_saran.discard(user_id)
+        if caption.lower().startswith("/saran"):
+            p = caption.split(maxsplit=1)
+            caption = p[1].strip() if len(p) > 1 else ""
+        await _teruskan_saran(update, context, teks=caption, photo_id=None)
+        return
+
+    if not get_spreadsheet_id(user_id):
+        await update.message.reply_text(pesan_belum_daftar(), parse_mode="Markdown")
+        return
+
+    # Batasi ukuran supaya nggak boros kuota Gemini untuk PDF besar/salah kirim.
+    if doc.file_size and doc.file_size > 15 * 1024 * 1024:
+        await update.message.reply_text(
+            "⚠️ File PDF terlalu besar (maks 15MB). Coba kirim versi lebih kecil, "
+            "atau foto struknya langsung."
+        )
+        return
+
+    await update.message.reply_text("📄 PDF diterima, sedang dibaca...")
+    pdf_file = await doc.get_file()
+    pdf_bytes = await pdf_file.download_as_bytearray()
+    await proses_struk(update, context, bytes(pdf_bytes), "application/pdf", caption)
+
+
+async def proses_struk(update: Update, context: ContextTypes.DEFAULT_TYPE, file_bytes: bytes, mime_type: str, caption: str):
+    """Inti pembacaan struk lewat Gemini, dipakai bareng oleh jalur foto (image/jpeg) dan PDF (application/pdf)."""
+    user_id = update.effective_user.id
     hari_ini = now_wib().strftime("%Y-%m-%d")
 
     try:
-        photo_file = await update.message.photo[-1].get_file()
-        photo_bytes = await photo_file.download_as_bytearray()
-
         prompt = f"""
         Kamu adalah asisten yang membaca struk belanja/pembayaran.
         Hari ini adalah {hari_ini}. Gunakan ini sebagai acuan tahun,
         JANGAN menebak tahun lain kecuali struk mencantumkan tahun dengan jelas.
 
-        Baca gambar struk ini dan balas dengan JSON saja, tanpa teks lain,
-        tanpa markdown backticks:
+        Baca struk ini (bisa berupa gambar atau dokumen PDF) dan balas dengan
+        JSON saja, tanpa teks lain, tanpa markdown backticks:
 
         {{
             "merchant": "nama toko/tempat",
@@ -1646,12 +1683,12 @@ async def terima_foto(update: Update, context: ContextTypes.DEFAULT_TYPE):
         - Lainnya: hanya jika benar-benar tidak masuk kategori mana pun
 
         Ambil TOTAL akhir yang dibayar.
-        Jika gambar berisi LEBIH DARI SATU struk, isi nominal dengan -1.
-        Jika gambar tidak jelas atau bukan struk, isi nominal dengan 0.
+        Jika struk berisi LEBIH DARI SATU transaksi/struk, isi nominal dengan -1.
+        Jika struk tidak jelas atau bukan struk/bukti pembayaran, isi nominal dengan 0.
         """
 
         response = gemini_model.generate_content(
-            [prompt, {"mime_type": "image/jpeg", "data": bytes(photo_bytes)}]
+            [prompt, {"mime_type": mime_type, "data": file_bytes}]
         )
         teks = re.sub(r"^```json\s*|\s*```$", "", response.text.strip()).strip()
         hasil = json.loads(teks)
@@ -1659,15 +1696,15 @@ async def terima_foto(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if nominal == -1:
             await update.message.reply_text(
-                "⚠️ Sepertinya ada beberapa struk dalam satu gambar.\n"
-                "Kirim satu foto untuk satu struk ya, supaya nominalnya akurat."
+                "⚠️ Sepertinya ada beberapa struk/transaksi dalam satu file.\n"
+                "Kirim satu file untuk satu struk ya, supaya nominalnya akurat."
             )
             return
 
         if not nominal or nominal == 0:
             await update.message.reply_text(
                 "⚠️ Struk tidak terbaca jelas.\n"
-                "Coba foto ulang lebih dekat, atau catat manual:\n"
+                "Coba foto ulang lebih dekat, kirim PDF lain, atau catat manual:\n"
                 "`/catat 50000 Makan catatan`",
                 parse_mode="Markdown",
             )
@@ -1686,7 +1723,7 @@ async def terima_foto(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "nominal": nominal,
             "merchant": hasil.get("merchant", "-"),
             "sumber": "Struk",
-            "catatan": "" if is_pertanyaan_cek(caption) else (update.message.caption or "").strip(),
+            "catatan": "" if is_pertanyaan_cek(caption) else caption,
         }
         token = buat_token(data)
 
@@ -2271,6 +2308,7 @@ def main():
     app.add_handler(CommandHandler("umumkan", umumkan))
     app.add_handler(CommandHandler("statususer", statususer))
     app.add_handler(MessageHandler(filters.PHOTO, terima_foto))
+    app.add_handler(MessageHandler(filters.Document.PDF, terima_pdf))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, terima_teks))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_error_handler(error_handler)
