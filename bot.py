@@ -94,11 +94,13 @@ def now_wib():
 # KATEGORI BAKU + normalisasi
 # ==========================================
 KATEGORI_BAKU = ["Makan", "Donasi", "Transport", "Belanja",
-                 "Hiburan", "Tagihan", "Investasi", "Lainnya"]
+                 "Hiburan", "Tagihan", "Investasi", "Tabungan", "Lainnya"]
 
 # Kata kunci -> kategori. Dicocokkan ke gabungan (kategori + merchant), huruf kecil.
 # Urutan penting: yang lebih spesifik didahulukan; "Makan" paling umum, ditaruh akhir.
 PETA_KATEGORI = {
+    "Tabungan": ["tabungan", "nabung", "menabung", "saving", "savings",
+                 "celengan", "dana darurat", "simpanan"],
     "Investasi": ["investasi", "invest", "indodax", "kripto", "crypto", "bitcoin",
                   "btc", "reksadana", "saham", "bibit", "ajaib", "pluang", "pintu",
                   "emas", "antam", "deposito", "kki-depo"],
@@ -1055,7 +1057,7 @@ async def _proses_teks_belanja(update, teks, user_id):
 Kalimat: "{teks_bersih}"
 
 Balas HANYA JSON, tanpa markdown, bentuk:
-{{"nominal": angka_tanpa_titik, "kategori": "salah satu dari: Makan, Donasi, Transport, Belanja, Hiburan, Tagihan, Investasi, Lainnya", "merchant": "nama toko/tempat atau '-'", "items": "daftar barang pisah koma atau ''"}}
+{{"nominal": angka_tanpa_titik, "kategori": "salah satu dari: Makan, Donasi, Transport, Belanja, Hiburan, Tagihan, Investasi, Tabungan, Lainnya", "merchant": "nama toko/tempat atau '-'", "items": "daftar barang pisah koma atau ''"}}
 
 Aturan:
 - nominal rupiah: "20rb"/"20 ribu" = 20000, "1,5jt"/"1.5 juta" = 1500000.
@@ -1669,7 +1671,7 @@ async def proses_struk(update: Update, context: ContextTypes.DEFAULT_TYPE, file_
             "tanggal": "YYYY-MM-DD (kalau tidak jelas gunakan {hari_ini})",
             "nominal": angka_total_tanpa_titik_atau_koma,
             "items": "daftar barang yang dibeli, pisahkan dengan koma (kalau tidak jelas isi '')",
-            "kategori": "WAJIB pilih SATU dari: Makan, Donasi, Transport, Belanja, Hiburan, Tagihan, Investasi, Lainnya"
+            "kategori": "WAJIB pilih SATU dari: Makan, Donasi, Transport, Belanja, Hiburan, Tagihan, Investasi, Tabungan, Lainnya"
         }}
 
         Panduan memilih kategori (tebak dari nama merchant/isi struk):
@@ -1680,6 +1682,7 @@ async def proses_struk(update: Update, context: ContextTypes.DEFAULT_TYPE, file_
         - Hiburan: warnet/game center, bioskop, langganan hiburan
         - Tagihan: listrik/PLN, pulsa/data, Apple/Google, cicilan, Pay Later
         - Investasi: Indodax, kripto, reksadana, saham, emas
+        - Tabungan: setor/transfer ke rekening tabungan, celengan, dana darurat
         - Lainnya: hanya jika benar-benar tidak masuk kategori mana pun
 
         Ambil TOTAL akhir yang dibayar.
