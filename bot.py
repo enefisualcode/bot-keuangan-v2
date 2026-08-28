@@ -96,6 +96,11 @@ def now_wib():
 KATEGORI_BAKU = ["Makan", "Donasi", "Transport", "Belanja",
                  "Hiburan", "Tagihan", "Investasi", "Tabungan", "Lainnya"]
 
+# Saldo tabungan yang sudah ada SEBELUM mulai dicatat lewat bot — dipakai supaya
+# "Tabungan Kumulatif" di sheet Dashboard nyambung dengan saldo nyata.
+# Harus SAMA PERSIS dengan SALDO_AWAL_TABUNGAN di index.html.
+SALDO_AWAL_TABUNGAN = 418751
+
 # Kata kunci -> kategori. Dicocokkan ke gabungan (kategori + merchant), huruf kecil.
 # Urutan penting: yang lebih spesifik didahulukan; "Makan" paling umum, ditaruh akhir.
 PETA_KATEGORI = {
@@ -254,10 +259,11 @@ def _isi_dashboard(ws, sep, colsep):
     ws.batch_update([
         # --- Blok ringkasan (A:B) ---
         {"range": "A1", "values": [["  RINGKASAN PERIODE BERJALAN"]]},
-        {"range": "A2:A8", "values": [
+        {"range": "A2:A10", "values": [
             ["Periode"], ["Total Pemasukan"], ["Total Pengeluaran"],
             ["Selisih"], ["Rata-rata Harian"],
             ["Total Investasi"], ["Investasi Kumulatif"],
+            ["Total Tabungan"], ["Tabungan Kumulatif"],
         ]},
         {"range": "B2", "values": [[f(T_LABEL_PERIODE)]]},
         {"range": "B3", "values": [[f(
@@ -285,16 +291,28 @@ def _isi_dashboard(ws, sep, colsep):
             + P + '!$C$2:$C)')]]},
         {"range": "B8", "values": [[f(
             '=SUMIF(' + P + '!$B$2:$B~"Investasi"~' + P + '!$C$2:$C)')]]},
+        {"range": "B9", "values": [[f(
+            '=SUMPRODUCT((' + P + '!$B$2:$B="Tabungan")*'
+            '(' + P + '!$A$2:$A>=IF(DAY(TODAY())>=25~'
+            'DATE(YEAR(TODAY())~MONTH(TODAY())~25)~'
+            'DATE(YEAR(TODAY())~MONTH(TODAY())-1~25)))*'
+            '(' + P + '!$A$2:$A<=IF(DAY(TODAY())>=25~'
+            'DATE(YEAR(TODAY())~MONTH(TODAY())+1~24)~'
+            'DATE(YEAR(TODAY())~MONTH(TODAY())~24)))*'
+            + P + '!$C$2:$C)')]]},
+        {"range": "B10", "values": [[f(
+            '=SUMIF(' + P + '!$B$2:$B~"Tabungan"~' + P + '!$C$2:$C)+'
+            + str(SALDO_AWAL_TABUNGAN))]]},
 
-        # --- Blok pengeluaran per kategori (A10:B) ---
-        {"range": "A10", "values": [["  PENGELUARAN PER KATEGORI"]]},
-        {"range": "A11:B11", "values": [["Kategori", "Total"]]},
-        {"range": "A12", "values": [[f(
+        # --- Blok pengeluaran per kategori (A:B) ---
+        {"range": "A12", "values": [["  PENGELUARAN PER KATEGORI"]]},
+        {"range": "A13:B13", "values": [["Kategori", "Total"]]},
+        {"range": "A14", "values": [[f(
             '=IFERROR(SORT(UNIQUE(FILTER($N$2:$N$5000~'
             '$N$2:$N$5000<>""))~1~TRUE)~"")')]]},
-        {"range": "B12", "values": [[f(
-            '=ARRAYFORMULA(IF($A$12:$A$42=""~""~'
-            'SUMIF($N$2:$N$5000~$A$12:$A$42~'
+        {"range": "B14", "values": [[f(
+            '=ARRAYFORMULA(IF($A$14:$A$44=""~""~'
+            'SUMIF($N$2:$N$5000~$A$14:$A$44~'
             + P + '!$C$2:$C$5000)))')]]},
 
         # --- Blok rekap harian (D:E) ---
@@ -355,13 +373,13 @@ def _rapikan_dashboard(ss, ws):
         repeat(rng(0, 0, 1, 2), judul, "userEnteredFormat"),
         repeat(rng(0, 3, 1, 5), judul, "userEnteredFormat"),
         repeat(rng(0, 6, 1, 9), judul, "userEnteredFormat"),
-        {"mergeCells": {"range": rng(9, 0, 10, 2), "mergeType": "MERGE_ALL"}},
-        repeat(rng(9, 0, 10, 2), judul, "userEnteredFormat"),
-        repeat(rng(10, 0, 11, 2), tebal, "userEnteredFormat"),
-        repeat(rng(11, 1, 42, 2), angka, "userEnteredFormat.numberFormat"),
+        {"mergeCells": {"range": rng(11, 0, 12, 2), "mergeType": "MERGE_ALL"}},
+        repeat(rng(11, 0, 12, 2), judul, "userEnteredFormat"),
+        repeat(rng(12, 0, 13, 2), tebal, "userEnteredFormat"),
+        repeat(rng(13, 1, 44, 2), angka, "userEnteredFormat.numberFormat"),
         repeat(rng(1, 3, 2, 5), tebal, "userEnteredFormat"),
         repeat(rng(1, 6, 2, 9), tebal, "userEnteredFormat"),
-        repeat(rng(2, 1, 8, 2), angka, "userEnteredFormat.numberFormat"),
+        repeat(rng(2, 1, 10, 2), angka, "userEnteredFormat.numberFormat"),
         repeat(rng(2, 3, 300, 4),
                {"numberFormat": {"type": "DATE",
                                  "pattern": "ddd, dd mmm yyyy"}},
