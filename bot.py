@@ -1156,6 +1156,52 @@ async def info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def perbaruidashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Tulis ulang formula sheet Dashboard dengan versi kode terbaru.
+    Beda dengan /buatkan (yang menolak jalan kalau sudah terhubung dan
+    tidak pernah menyentuh Dashboard yang sudah ada), perintah ini
+    KHUSUS untuk user yang SUDAH terhubung dan mau menarik pembaruan
+    struktur Dashboard (mis. baris Tabungan/Investasi Kumulatif baru)
+    tanpa harus bikin spreadsheet baru."""
+    sid = get_spreadsheet_id(update.effective_user.id)
+    if not sid:
+        await update.message.reply_text(pesan_belum_daftar(), parse_mode="Markdown")
+        return
+
+    await update.message.reply_text("🔄 Memperbarui sheet Dashboard ke versi terbaru...")
+    try:
+        ss = get_client().open_by_key(sid)
+        try:
+            ws = ss.worksheet(SHEET_DASHBOARD)
+        except gspread.WorksheetNotFound:
+            ws = ss.add_worksheet(title=SHEET_DASHBOARD, rows=300, cols=14)
+
+        sep, colsep = deteksi_pemisah(ss)
+        _isi_dashboard(ws, sep, colsep)
+
+        # Verifikasi: kalau sel bantuan K1 error, berarti tebakan pemisah salah.
+        try:
+            cek = ws.acell("K1", value_render_option="UNFORMATTED_VALUE").value
+            if isinstance(cek, str) and cek.startswith("#"):
+                alt = (";", "\\") if sep == "," else (",", ",")
+                _isi_dashboard(ws, alt[0], alt[1])
+        except Exception as e:
+            logger.error(f"Gagal verifikasi formula dashboard: {e}")
+
+        _rapikan_dashboard(ss, ws)
+        await update.message.reply_text(
+            "✅ Sheet Dashboard sudah diperbarui — termasuk baris *Total Tabungan* "
+            "dan *Tabungan/Investasi Kumulatif* yang baru.\n\n"
+            "⚠️ Kalau kamu pernah menambah/mengedit sel manual di sheet Dashboard "
+            "(di luar yang otomatis ditulis bot), sel itu bisa ketimpa. Kustomisasi "
+            "di sheet LAIN (Pengeluaran/Pemasukan/dsb) tidak tersentuh.",
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        logger.error(f"Gagal perbarui dashboard: {e}")
+        await update.message.reply_text("❌ Gagal memperbarui dashboard. Coba lagi sebentar.")
+
+
 # ==========================================
 # HANDLER: /dummy dan /hapusdummy (untuk uji coba)
 # ==========================================
@@ -2315,6 +2361,7 @@ def main():
     app.add_handler(CommandHandler("daftar", daftar))
     app.add_handler(CommandHandler("buatkan", buatkan))
     app.add_handler(CommandHandler("info", info))
+    app.add_handler(CommandHandler("perbaruidashboard", perbaruidashboard))
     app.add_handler(CommandHandler("catat", catat_manual))
     app.add_handler(CommandHandler("masuk", catat_masuk))
     app.add_handler(CommandHandler("hapus", hapus))
