@@ -616,6 +616,7 @@ def load_user_map(force=False):
                 mapping[uid] = sid
     except Exception as e:
         logger.error(f"Gagal load daftar user: {e}")
+        return _user_map or {}
     _user_map = mapping
     return _user_map
 
