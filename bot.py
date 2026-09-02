@@ -22,8 +22,12 @@ import logging
 import json
 import re
 import os
+import shutil
 import uuid
 import asyncio
+import time
+import socket
+import requests
 from datetime import datetime, timedelta, timezone
 
 import gspread
@@ -64,10 +68,17 @@ SHEET_DASHBOARD = os.environ.get("SHEET_DASHBOARD", "Dashboard")
 
 CREDENTIALS_FILE = "credentials.json"
 GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON", "")
+# Alternatif yang lebih tahan banting daripada GOOGLE_CREDENTIALS_JSON:
+# taruh file JSON kredensial di server lalu arahkan path-nya lewat env var ini.
+# Ini menghindari masalah karakter \n di dalam private_key yang gampang rusak
+# kalau dititipkan sebagai satu baris teks di file .env / systemd EnvironmentFile.
+GOOGLE_CREDENTIALS_FILE = os.environ.get("GOOGLE_CREDENTIALS_FILE", "")
 
 if GOOGLE_CREDENTIALS_JSON:
     with open(CREDENTIALS_FILE, "w") as f:
         f.write(GOOGLE_CREDENTIALS_JSON)
+elif GOOGLE_CREDENTIALS_FILE and os.path.exists(GOOGLE_CREDENTIALS_FILE):
+    shutil.copy(GOOGLE_CREDENTIALS_FILE, CREDENTIALS_FILE)
 
 # Email service account, dipakai untuk instruksi share ke user
 try:
@@ -190,6 +201,43 @@ def get_client():
         creds = ServiceAccountCredentials.from_json_keyfile_name(CREDENTIALS_FILE, scope)
         _client = gspread.authorize(creds)
     return _client
+
+
+# Error jaringan sesaat (timeout, koneksi putus di tengah jalan) — bukan
+# masalah izin akses, jadi aman & masuk akal untuk dicoba ulang otomatis.
+# Umum terjadi di VPS dengan bandwidth internasional terbatas, karena
+# tiap panggilan ke Google Sheets API keluar lewat jalur internasional.
+_ERROR_JARINGAN_SESAAT = (
+    requests.exceptions.RequestException,
+    socket.timeout,
+    TimeoutError,
+    ConnectionError,
+)
+
+
+def dengan_retry(fn, *args, percobaan=3, jeda_awal=1.5, **kwargs):
+    """Jalankan fn(*args, **kwargs). Kalau gagal karena gangguan jaringan
+    sesaat atau Google API lagi sibuk (429/5xx), otomatis dicoba ulang
+    beberapa kali dengan jeda yang makin lama. Error lain (mis. izin akses
+    ditolak, spreadsheet tidak ditemukan) langsung dilempar tanpa buang
+    waktu retry, karena mengulang tidak akan mengubah hasilnya."""
+    for percobaan_ke in range(1, percobaan + 1):
+        try:
+            return fn(*args, **kwargs)
+        except gspread.exceptions.APIError as e:
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            transient = status in (429, 500, 502, 503, 504)
+            if not transient or percobaan_ke == percobaan:
+                raise
+        except _ERROR_JARINGAN_SESAAT:
+            if percobaan_ke == percobaan:
+                raise
+        jeda = jeda_awal * (2 ** (percobaan_ke - 1))
+        logger.warning(
+            f"[retry] percobaan {percobaan_ke}/{percobaan} gagal (gangguan jaringan?), "
+            f"coba lagi dalam {jeda:.1f} detik..."
+        )
+        time.sleep(jeda)
 
 
 def get_or_create_worksheet(spreadsheet, nama, header):
@@ -616,7 +664,6 @@ def load_user_map(force=False):
                 mapping[uid] = sid
     except Exception as e:
         logger.error(f"Gagal load daftar user: {e}")
-        return _user_map or {}
     _user_map = mapping
     return _user_map
 
@@ -653,23 +700,27 @@ def get_spreadsheet_id(user_id):
 # ------------------------------------------
 def simpan_pengeluaran(user_id, tanggal, kategori, nominal, merchant,
                        sumber, catatan, tipe_bayar, barang=""):
-    sid = get_spreadsheet_id(user_id)
-    ss = get_client().open_by_key(sid)
-    ws = get_or_create_worksheet(ss, SHEET_PENGELUARAN, HEADER_PENGELUARAN)
-    ws.append_row(
-        [tanggal, kategori, nominal, merchant, sumber, catatan, tipe_bayar, barang],
-        value_input_option="USER_ENTERED",
-    )
+    def _simpan():
+        sid = get_spreadsheet_id(user_id)
+        ss = get_client().open_by_key(sid)
+        ws = get_or_create_worksheet(ss, SHEET_PENGELUARAN, HEADER_PENGELUARAN)
+        ws.append_row(
+            [tanggal, kategori, nominal, merchant, sumber, catatan, tipe_bayar, barang],
+            value_input_option="USER_ENTERED",
+        )
+    dengan_retry(_simpan)
 
 
 def simpan_pemasukan(user_id, tanggal, kategori, nominal, sumber, catatan):
-    sid = get_spreadsheet_id(user_id)
-    ss = get_client().open_by_key(sid)
-    ws = get_or_create_worksheet(ss, SHEET_PEMASUKAN, HEADER_PEMASUKAN)
-    ws.append_row(
-        [tanggal, kategori, nominal, sumber, catatan],
-        value_input_option="USER_ENTERED",
-    )
+    def _simpan():
+        sid = get_spreadsheet_id(user_id)
+        ss = get_client().open_by_key(sid)
+        ws = get_or_create_worksheet(ss, SHEET_PEMASUKAN, HEADER_PEMASUKAN)
+        ws.append_row(
+            [tanggal, kategori, nominal, sumber, catatan],
+            value_input_option="USER_ENTERED",
+        )
+    dengan_retry(_simpan)
 
 
 # ==========================================
