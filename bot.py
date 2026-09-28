@@ -698,12 +698,69 @@ def get_spreadsheet_id(user_id):
 # ------------------------------------------
 # Tulis transaksi ke spreadsheet milik user
 # ------------------------------------------
+class StrukDuplikatError(Exception):
+    """Struk yang sama sudah pernah tersimpan."""
+
+
+def _normalisasi_teks_struk(teks):
+    """Buat teks hasil OCR layak dibandingkan walau beda kapital/tanda baca."""
+    return re.sub(r"[^a-z0-9]", "", (teks or "").lower())
+
+
+def _nominal_struk(nominal):
+    return re.sub(r"[^\d]", "", str(nominal))
+
+
+def cari_struk_sama(ws, tanggal, nominal, merchant, barang=""):
+    """Cari struk identik yang telah dicatat sebelumnya.
+
+    Tanggal, nominal, dan merchant harus sama. Jika kedua struk memiliki daftar
+    barang, daftar tersebut juga harus sama. Ini membuat dua transaksi berbeda
+    pada toko yang sama tidak langsung dianggap sebagai duplikat.
+    """
+    target_tanggal = str(tanggal)[:10]
+    target_nominal = _nominal_struk(nominal)
+    target_merchant = _normalisasi_teks_struk(merchant)
+    target_barang = _normalisasi_teks_struk(barang)
+
+    # OCR kadang gagal membaca nama merchant; dalam kondisi itu daftar barang
+    # masih bisa dipakai sebagai identitas struk.
+    if not target_merchant and not target_barang:
+        return None
+
+    for r in ws.get_all_values()[1:]:
+        sumber_lama = r[4] if len(r) > 4 else ""
+        if sumber_lama.strip().lower() != "struk":
+            continue
+        if len(r) < 4 or str(r[0])[:10] != target_tanggal:
+            continue
+        if _nominal_struk(r[2]) != target_nominal:
+            continue
+        merchant_lama = _normalisasi_teks_struk(r[3])
+        barang_lama = _normalisasi_teks_struk(r[7] if len(r) > 7 else "")
+        if target_merchant:
+            if merchant_lama != target_merchant:
+                continue
+        elif barang_lama != target_barang:
+            continue
+        # Jika daftar barang ada pada kedua struk, jadikan pembeda tambahan.
+        if target_barang and barang_lama and target_barang != barang_lama:
+            continue
+        return r
+    return None
+
+
 def simpan_pengeluaran(user_id, tanggal, kategori, nominal, merchant,
-                       sumber, catatan, tipe_bayar, barang=""):
+                       sumber, catatan, tipe_bayar, barang="",
+                       cegah_duplikat_struk=False):
     def _simpan():
         sid = get_spreadsheet_id(user_id)
         ss = get_client().open_by_key(sid)
         ws = get_or_create_worksheet(ss, SHEET_PENGELUARAN, HEADER_PENGELUARAN)
+        if cegah_duplikat_struk and cari_struk_sama(
+            ws, tanggal, nominal, merchant, barang
+        ):
+            raise StrukDuplikatError()
         ws.append_row(
             [tanggal, kategori, nominal, merchant, sumber, catatan, tipe_bayar, barang],
             value_input_option="USER_ENTERED",
@@ -2017,6 +2074,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # --- Batal ---
+    if aksi == "struk_batal":
         pending.pop(token, None)
         await query.edit_message_text("❌ Dibatalkan, data tidak disimpan.")
         return
@@ -2051,6 +2109,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 catatan=data.get("catatan", ""),
                 tipe_bayar=tipe,
                 barang=data.get("barang", ""),
+                cegah_duplikat_struk=data.get("sumber") == "Struk",
             )
             pending.pop(token, None)
             await query.edit_message_text(
@@ -2059,6 +2118,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"🏷️ {data['kategori']}\n"
                 f"💰 Rp{data['nominal']:,}\n"
                 f"{ikon} Tipe: *{tipe}*",
+                parse_mode="Markdown",
+            )
+        except StrukDuplikatError:
+            pending.pop(token, None)
+            await query.edit_message_text(
+                "⚠️ *Struk yang sama sudah pernah disimpan.*\n\n"
+                "Data tidak ditambahkan lagi agar transaksi tidak dobel.",
                 parse_mode="Markdown",
             )
         except Exception as e:
@@ -2230,6 +2296,7 @@ TEKS_FITUR = (
     "📸 *Foto struk otomatis*\n"
     "Kirim foto struk, dibaca sendiri (termasuk daftar barang).\n"
     "• *Caption* jadi catatan.\n"
+    "• Struk yang sama otomatis ditolak agar transaksi tidak dobel.\n"
     "• Caption berupa pertanyaan (mis. \"sudah pernah diupload?\") → bot cek duplikat dulu.\n\n"
     "📊 *Rekap transaksi*\n"
     "`/rekap hari ini` · `/rekap 1 agustus 2026` · `/rekap bulan ini`\n"
