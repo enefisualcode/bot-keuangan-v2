@@ -2287,7 +2287,8 @@ async def tanya(update: Update, context: ContextTypes.DEFAULT_TYPE):
 Di bawah ini data transaksi user, satu baris per transaksi dengan format:
 tanggal|OUT/IN|kategori|nominal|merchant|catatan|tipe_bayar
 OUT = pengeluaran, IN = pemasukan. Nominal dalam Rupiah.
-Siklus periode keuangan: tanggal 25 sampai 24 bulan berikutnya.
+Siklus periode keuangan dimulai pada tanggal gajian aktual: tanggal 25, atau
+hari kerja sebelumnya jika tanggal 25 jatuh pada akhir pekan/libur/cuti bersama.
 
 DATA:
 {data}
