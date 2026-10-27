@@ -65,6 +65,7 @@ ADMIN_ID = os.environ.get("ADMIN_ID", "").strip()
 SHEET_PENGELUARAN = os.environ.get("SHEET_PENGELUARAN", "Pengeluaran")
 SHEET_PEMASUKAN = os.environ.get("SHEET_PEMASUKAN", "Pemasukan")
 SHEET_DASHBOARD = os.environ.get("SHEET_DASHBOARD", "Dashboard")
+SHEET_KALENDER_LIBUR = os.environ.get("SHEET_KALENDER_LIBUR", "Kalender Libur")
 
 CREDENTIALS_FILE = "credentials.json"
 GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON", "")
@@ -91,6 +92,7 @@ HEADER_PENGELUARAN = ["Tanggal", "Kategori", "Nominal", "Merchant",
                       "Sumber", "Catatan", "Tipe Bayar", "Barang"]
 HEADER_PEMASUKAN = ["Tanggal", "Kategori", "Nominal", "Sumber", "Catatan"]
 HEADER_USERS = ["user_id", "username", "spreadsheet_id", "tanggal_daftar"]
+HEADER_KALENDER_LIBUR = ["Tanggal", "Keterangan"]
 
 # ==========================================
 # WAKTU: selalu pakai WIB (server Railway pakai UTC)
@@ -250,6 +252,37 @@ def get_or_create_worksheet(spreadsheet, nama, header):
         return ws
 
 
+def setup_kalender_libur(ss):
+    """Siapkan daftar tanggal merah/cuti bersama yang dipakai formula payroll."""
+    ws = get_or_create_worksheet(ss, SHEET_KALENDER_LIBUR, HEADER_KALENDER_LIBUR)
+    try:
+        ss.batch_update({"requests": [
+            {"repeatCell": {
+                "range": {"sheetId": ws.id, "startRowIndex": 0,
+                          "endRowIndex": 1, "startColumnIndex": 0,
+                          "endColumnIndex": 2},
+                "cell": {"userEnteredFormat": {
+                    "backgroundColor": {"red": 0.55, "green": 0.25, "blue": 0.12},
+                    "textFormat": {"bold": True, "foregroundColor":
+                                   {"red": 1, "green": 1, "blue": 1}}}},
+                "fields": "userEnteredFormat"}},
+            {"repeatCell": {
+                "range": {"sheetId": ws.id, "startRowIndex": 1,
+                          "endRowIndex": 1000, "startColumnIndex": 0,
+                          "endColumnIndex": 1},
+                "cell": {"userEnteredFormat": {
+                    "numberFormat": {"type": "DATE", "pattern": "yyyy-mm-dd"}}},
+                "fields": "userEnteredFormat.numberFormat"}},
+            {"updateSheetProperties": {
+                "properties": {"sheetId": ws.id,
+                               "gridProperties": {"frozenRowCount": 1}},
+                "fields": "gridProperties.frozenRowCount"}},
+        ]})
+    except Exception as e:
+        logger.error(f"Gagal menyiapkan {SHEET_KALENDER_LIBUR}: {e}")
+    return ws
+
+
 
 # ------------------------------------------
 # Dashboard otomatis di spreadsheet user
@@ -264,23 +297,35 @@ def get_or_create_worksheet(spreadsheet, nama, header):
 # Koma di dalam string QUERY ("select A, sum(C)") sengaja dibiarkan apa adanya
 # karena itu bagian dari bahasa QUERY, bukan pemisah argumen formula.
 
-T_KEY_PERIODE = '=TEXT(EDATE(TODAY()~IF(DAY(TODAY())>=25~0~-1))~"YYYY-MM")'
+_LIBUR = "'" + SHEET_KALENDER_LIBUR.replace("'", "''") + "'!$A$2:$A$1000"
 
-T_LABEL_PERIODE = (
-    '=IF(DAY(TODAY())>=25~'
-    'TEXT(DATE(YEAR(TODAY())~MONTH(TODAY())~25)~"d mmm")&" - "&'
-    'TEXT(DATE(YEAR(TODAY())~MONTH(TODAY())+1~24)~"d mmm yyyy")~'
-    'TEXT(DATE(YEAR(TODAY())~MONTH(TODAY())-1~25)~"d mmm")&" - "&'
-    'TEXT(DATE(YEAR(TODAY())~MONTH(TODAY())~24)~"d mmm yyyy"))'
+# Tanggal gajian adalah hari kerja terakhir sebelum tanggal 25. Dengan rumus
+# ini, tanggal 25 Sabtu/Minggu menjadi Jumat tanggal 23, sedangkan tanggal 25
+# yang tercatat di Kalender Libur mundur ke hari kerja sebelumnya.
+T_GAJIAN_BULAN_INI = (
+    '=WORKDAY.INTL(DATE(YEAR(TODAY())~MONTH(TODAY())~26)~-1~1~' + _LIBUR + ')'
 )
+T_GAJIAN_BULAN_LALU = (
+    '=WORKDAY.INTL(DATE(YEAR(TODAY())~MONTH(TODAY())-1~26)~-1~1~' + _LIBUR + ')'
+)
+T_GAJIAN_BULAN_DEPAN = (
+    '=WORKDAY.INTL(DATE(YEAR(TODAY())~MONTH(TODAY())+1~26)~-1~1~' + _LIBUR + ')'
+)
+T_START_PERIODE = '=IF(TODAY()>=' + T_GAJIAN_BULAN_INI[1:] + '~' + T_GAJIAN_BULAN_INI[1:] + '~' + T_GAJIAN_BULAN_LALU[1:] + ')'
+T_END_PERIODE = '=' + T_GAJIAN_BULAN_DEPAN[1:] + '-1'
+T_KEY_PERIODE = '=TEXT($K$2~"YYYY-MM")'
+T_LABEL_PERIODE = '=TEXT($K$2~"d mmm")&" - "&TEXT($K$3~"d mmm yyyy")'
 
 
 def _t_helper(sheet):
-    """Label periode 25-24 untuk tiap baris transaksi."""
+    """Label periode berdasarkan tanggal gajian untuk tiap baris transaksi."""
+    d = f"{sheet}!A2:A5000"
+    payday = 'WORKDAY.INTL(DATE(YEAR(' + d + ')~MONTH(' + d + ')~26)~-1~1~' + _LIBUR + ')'
+    payday_prev = 'WORKDAY.INTL(DATE(YEAR(' + d + ')~MONTH(' + d + ')-1~26)~-1~1~' + _LIBUR + ')'
     return (
         '=ARRAYFORMULA(IF({s}!A2:A5000=""~""~'
-        'TEXT(EDATE({s}!A2:A5000~IF(DAY({s}!A2:A5000)>=25~0~-1))~"YYYY-MM")))'
-    ).format(s=sheet)
+        'TEXT(IF({s}!A2:A5000>={payday}~{payday}~{payday_prev})~"YYYY-MM")))'
+    ).format(s=sheet, payday=payday, payday_prev=payday_prev)
 
 
 def deteksi_pemisah(ss):
@@ -321,32 +366,20 @@ def _isi_dashboard(ws, sep, colsep):
         {"range": "B5", "values": [["=B3-B4"]]},
         {"range": "B6", "values": [[f(
             '=IFERROR(B4/COUNTA(UNIQUE(FILTER(' + P + '!$A$2:$A~'
-            '(' + P + '!$A$2:$A>=IF(DAY(TODAY())>=25~'
-            'DATE(YEAR(TODAY())~MONTH(TODAY())~25)~'
-            'DATE(YEAR(TODAY())~MONTH(TODAY())-1~25)))*'
-            '(' + P + '!$A$2:$A<=IF(DAY(TODAY())>=25~'
-            'DATE(YEAR(TODAY())~MONTH(TODAY())+1~24)~'
-            'DATE(YEAR(TODAY())~MONTH(TODAY())~24)))'
+            '(' + P + '!$A$2:$A>=$K$2)*'
+            '(' + P + '!$A$2:$A<=$K$3)'
             ')))~0)')]]},
         {"range": "B7", "values": [[f(
             '=SUMPRODUCT((' + P + '!$B$2:$B="Investasi")*'
-            '(' + P + '!$A$2:$A>=IF(DAY(TODAY())>=25~'
-            'DATE(YEAR(TODAY())~MONTH(TODAY())~25)~'
-            'DATE(YEAR(TODAY())~MONTH(TODAY())-1~25)))*'
-            '(' + P + '!$A$2:$A<=IF(DAY(TODAY())>=25~'
-            'DATE(YEAR(TODAY())~MONTH(TODAY())+1~24)~'
-            'DATE(YEAR(TODAY())~MONTH(TODAY())~24)))*'
+            '(' + P + '!$A$2:$A>=$K$2)*'
+            '(' + P + '!$A$2:$A<=$K$3)*'
             + P + '!$C$2:$C)')]]},
         {"range": "B8", "values": [[f(
             '=SUMIF(' + P + '!$B$2:$B~"Investasi"~' + P + '!$C$2:$C)')]]},
         {"range": "B9", "values": [[f(
             '=SUMPRODUCT((' + P + '!$B$2:$B="Tabungan")*'
-            '(' + P + '!$A$2:$A>=IF(DAY(TODAY())>=25~'
-            'DATE(YEAR(TODAY())~MONTH(TODAY())~25)~'
-            'DATE(YEAR(TODAY())~MONTH(TODAY())-1~25)))*'
-            '(' + P + '!$A$2:$A<=IF(DAY(TODAY())>=25~'
-            'DATE(YEAR(TODAY())~MONTH(TODAY())+1~24)~'
-            'DATE(YEAR(TODAY())~MONTH(TODAY())~24)))*'
+            '(' + P + '!$A$2:$A>=$K$2)*'
+            '(' + P + '!$A$2:$A<=$K$3)*'
             + P + '!$C$2:$C)')]]},
         {"range": "B10", "values": [[f(
             '=SUMIF(' + P + '!$B$2:$B~"Tabungan"~' + P + '!$C$2:$C)+'
@@ -387,6 +420,8 @@ def _isi_dashboard(ws, sep, colsep):
 
         # --- Sel bantuan (K:M), disembunyikan ---
         {"range": "K1", "values": [[f(T_KEY_PERIODE)]]},
+        {"range": "K2", "values": [[f(T_START_PERIODE)]]},
+        {"range": "K3", "values": [[f(T_END_PERIODE)]]},
         {"range": "L2", "values": [[f(_t_helper(P))]]},
         {"range": "M2", "values": [[f(_t_helper(M))]]},
         {"range": "N2", "values": [[f(
@@ -950,6 +985,7 @@ async def _proses_daftar(update, spreadsheet_id, user):
                        {"red": 0.15, "green": 0.35, "blue": 0.55})   # biru tua
         rapikan_header(ss, ws_in, len(HEADER_PEMASUKAN),
                        {"red": 0.13, "green": 0.42, "blue": 0.31})   # hijau tua
+        setup_kalender_libur(ss)
         ws_dash, _ = setup_dashboard(ss)
         setup_grafik(ss, ws_dash.id)
         hapus_sheet_bawaan(ss)
@@ -984,7 +1020,9 @@ async def _proses_daftar(update, spreadsheet_id, user):
         f"✅ *Berhasil terhubung!*\n\n"
         f"📄 Spreadsheet: *{judul}*\n"
         f"📑 Sheet *{SHEET_PENGELUARAN}*, *{SHEET_PEMASUKAN}*, "
-        f"*{SHEET_DASHBOARD}*, dan *{SHEET_GRAFIK}* sudah siap.\n\n"
+        f"*{SHEET_DASHBOARD}*, *{SHEET_GRAFIK}*, dan *{SHEET_KALENDER_LIBUR}* sudah siap.\n\n"
+        f"📅 Isi tanggal merah/cuti bersama (format YYYY-MM-DD) di sheet *{SHEET_KALENDER_LIBUR}*. "
+        f"Tanggal gajian akan otomatis memakai hari kerja terakhir sebelum tanggal 25.\n\n"
         f"📊 Dashboard akan terisi sendiri begitu ada transaksi.\n\n"
         f"Coba sekarang:\n`/catat 15000 Makan nasi goreng`",
         parse_mode="Markdown",
@@ -1280,6 +1318,7 @@ async def perbaruidashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔄 Memperbarui sheet Dashboard ke versi terbaru...")
     try:
         ss = get_client().open_by_key(sid)
+        setup_kalender_libur(ss)
         try:
             ws = ss.worksheet(SHEET_DASHBOARD)
         except gspread.WorksheetNotFound:
