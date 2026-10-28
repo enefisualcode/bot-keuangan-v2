@@ -91,7 +91,7 @@ except Exception:
 HEADER_PENGELUARAN = ["Tanggal", "Kategori", "Nominal", "Merchant",
                       "Sumber", "Catatan", "Tipe Bayar", "Barang"]
 HEADER_PEMASUKAN = ["Tanggal", "Kategori", "Nominal", "Sumber", "Catatan"]
-HEADER_USERS = ["user_id", "username", "spreadsheet_id", "tanggal_daftar"]
+HEADER_USERS = ["user_id", "username", "spreadsheet_id", "tanggal_daftar", "awal_periode"]
 HEADER_KALENDER_LIBUR = ["Tanggal", "Keterangan"]
 
 # ==========================================
@@ -299,29 +299,28 @@ def setup_kalender_libur(ss):
 
 _LIBUR = "'" + SHEET_KALENDER_LIBUR.replace("'", "''") + "'!$A$2:$A$1000"
 
-# Tanggal gajian adalah hari kerja terakhir sebelum tanggal 25. Dengan rumus
-# ini, tanggal 25 Sabtu/Minggu menjadi Jumat tanggal 23, sedangkan tanggal 25
-# yang tercatat di Kalender Libur mundur ke hari kerja sebelumnya.
-T_GAJIAN_BULAN_INI = (
-    '=WORKDAY.INTL(DATE(YEAR(TODAY())~MONTH(TODAY())~26)~-1~1~' + _LIBUR + ')'
-)
-T_GAJIAN_BULAN_LALU = (
-    '=WORKDAY.INTL(DATE(YEAR(TODAY())~MONTH(TODAY())-1~26)~-1~1~' + _LIBUR + ')'
-)
-T_GAJIAN_BULAN_DEPAN = (
-    '=WORKDAY.INTL(DATE(YEAR(TODAY())~MONTH(TODAY())+1~26)~-1~1~' + _LIBUR + ')'
-)
-T_START_PERIODE = '=IF(TODAY()>=' + T_GAJIAN_BULAN_INI[1:] + '~' + T_GAJIAN_BULAN_INI[1:] + '~' + T_GAJIAN_BULAN_LALU[1:] + ')'
-T_END_PERIODE = '=IF(TODAY()>=' + T_GAJIAN_BULAN_INI[1:] + '~' + T_GAJIAN_BULAN_DEPAN[1:] + '-1~' + T_GAJIAN_BULAN_INI[1:] + '-1)'
+# Periode dashboard mengikuti tanggal awal pilihan masing-masing user.
 T_KEY_PERIODE = '=TEXT($K$2~"YYYY-MM")'
 T_LABEL_PERIODE = '=TEXT($K$2~"d mmm")&" - "&TEXT($K$3~"d mmm yyyy")'
 
 
-def _t_helper(sheet):
-    """Label periode berdasarkan tanggal gajian untuk tiap baris transaksi."""
+def _formula_periode(awal_periode):
+    """Formula periode; tanggal target dimajukan ke hari kerja sebelumnya."""
+    hari = max(1, min(28, int(awal_periode)))
+    bulan_ini = f'WORKDAY.INTL(DATE(YEAR(TODAY())~MONTH(TODAY())~{hari + 1})~-1~1~{_LIBUR})'
+    bulan_lalu = f'WORKDAY.INTL(DATE(YEAR(TODAY())~MONTH(TODAY())-1~{hari + 1})~-1~1~{_LIBUR})'
+    bulan_depan = f'WORKDAY.INTL(DATE(YEAR(TODAY())~MONTH(TODAY())+1~{hari + 1})~-1~1~{_LIBUR})'
+    mulai = f'=IF(TODAY()>={bulan_ini}~{bulan_ini}~{bulan_lalu})'
+    selesai = f'=IF(TODAY()>={bulan_ini}~{bulan_depan}-1~{bulan_ini}-1)'
+    return mulai, selesai
+
+
+def _t_helper(sheet, awal_periode=25):
+    """Label periode untuk tiap transaksi sesuai tanggal awal pilihan user."""
+    hari = max(1, min(28, int(awal_periode)))
     d = f"{sheet}!A2:A5000"
-    payday = 'WORKDAY.INTL(DATE(YEAR(' + d + ')~MONTH(' + d + ')~26)~-1~1~' + _LIBUR + ')'
-    payday_prev = 'WORKDAY.INTL(DATE(YEAR(' + d + ')~MONTH(' + d + ')-1~26)~-1~1~' + _LIBUR + ')'
+    payday = f'WORKDAY.INTL(DATE(YEAR({d})~MONTH({d})~{hari + 1})~-1~1~{_LIBUR})'
+    payday_prev = f'WORKDAY.INTL(DATE(YEAR({d})~MONTH({d})-1~{hari + 1})~-1~1~{_LIBUR})'
     return (
         '=ARRAYFORMULA(IF({s}!A2:A5000=""~""~'
         'TEXT(IF({s}!A2:A5000>={payday}~{payday}~{payday_prev})~"YYYY-MM")))'
@@ -341,13 +340,14 @@ def deteksi_pemisah(ss):
     return ";", "\\"
 
 
-def _isi_dashboard(ws, sep, colsep):
+def _isi_dashboard(ws, sep, colsep, awal_periode=25):
     """Tulis semua formula ke sheet Dashboard memakai pemisah yang sesuai."""
 
     def f(t):
         return t.replace("~", sep).replace("^", colsep)
 
     P, M = SHEET_PENGELUARAN, SHEET_PEMASUKAN
+    start_periode, end_periode = _formula_periode(awal_periode)
 
     ws.batch_update([
         # --- Blok ringkasan (A:B) ---
@@ -420,10 +420,10 @@ def _isi_dashboard(ws, sep, colsep):
 
         # --- Sel bantuan (K:M), disembunyikan ---
         {"range": "K1", "values": [[f(T_KEY_PERIODE)]]},
-        {"range": "K2", "values": [[f(T_START_PERIODE)]]},
-        {"range": "K3", "values": [[f(T_END_PERIODE)]]},
-        {"range": "L2", "values": [[f(_t_helper(P))]]},
-        {"range": "M2", "values": [[f(_t_helper(M))]]},
+        {"range": "K2", "values": [[f(start_periode)]]},
+        {"range": "K3", "values": [[f(end_periode)]]},
+        {"range": "L2", "values": [[f(_t_helper(P, awal_periode))]]},
+        {"range": "M2", "values": [[f(_t_helper(M, awal_periode))]]},
         {"range": "N2", "values": [[f(
             '=ARRAYFORMULA(IF(($L$2:$L$5000=$K$1)*'
             '(' + P + '!$B$2:$B$5000<>"")~'
@@ -646,7 +646,7 @@ def setup_grafik(ss, dash_id):
     return True
 
 
-def setup_dashboard(ss):
+def setup_dashboard(ss, awal_periode=25):
     """Buat sheet Dashboard berisi ringkasan otomatis.
     Kalau sudah ada, dibiarkan supaya kustomisasi user tidak hilang."""
     try:
@@ -657,7 +657,7 @@ def setup_dashboard(ss):
     ws = ss.add_worksheet(title=SHEET_DASHBOARD, rows=300, cols=14)
 
     sep, colsep = deteksi_pemisah(ss)
-    _isi_dashboard(ws, sep, colsep)
+    _isi_dashboard(ws, sep, colsep, awal_periode)
 
     # Verifikasi: kalau sel bantuan K1 error, berarti tebakan pemisah salah.
     # Tulis ulang memakai pemisah satunya.
@@ -666,7 +666,7 @@ def setup_dashboard(ss):
         if isinstance(cek, str) and cek.startswith("#"):
             alt = (";", "\\") if sep == "," else (",", ",")
             logger.warning(f"Pemisah '{sep}' ditolak, coba '{alt[0]}'")
-            _isi_dashboard(ws, alt[0], alt[1])
+            _isi_dashboard(ws, alt[0], alt[1], awal_periode)
     except Exception as e:
         logger.error(f"Gagal verifikasi formula dashboard: {e}")
 
@@ -677,19 +677,25 @@ def setup_dashboard(ss):
 # ------------------------------------------
 # Daftar user (mapping user_id -> spreadsheet_id)
 # ------------------------------------------
-_user_map = None  # cache di memori
+_user_map = None  # cache user_id -> spreadsheet_id
+_user_period_map = {}  # cache user_id -> tanggal awal periode (1..28)
 
 
 def get_users_sheet():
     ss = get_client().open_by_key(MASTER_SPREADSHEET_ID)
-    return get_or_create_worksheet(ss, USERS_SHEET, HEADER_USERS)
+    ws = get_or_create_worksheet(ss, USERS_SHEET, HEADER_USERS)
+    # Migrasi ringan untuk sheet Users lama yang baru punya empat kolom.
+    header = ws.row_values(1)
+    if len(header) < 5 or header[4] != "awal_periode":
+        ws.update("E1", [["awal_periode"]], value_input_option="USER_ENTERED")
+    return ws
 
 
 def load_user_map(force=False):
-    global _user_map
+    global _user_map, _user_period_map
     if _user_map is not None and not force:
         return _user_map
-    mapping = {}
+    mapping, periods = {}, {}
     try:
         rows = get_users_sheet().get_all_records()
         for r in rows:
@@ -697,9 +703,16 @@ def load_user_map(force=False):
             sid = str(r.get("spreadsheet_id", "")).strip()
             if uid and sid:
                 mapping[uid] = sid
+                try:
+                    hari = int(r.get("awal_periode", 0))
+                    if 1 <= hari <= 28:
+                        periods[uid] = hari
+                except (TypeError, ValueError):
+                    pass
     except Exception as e:
         logger.error(f"Gagal load daftar user: {e}")
     _user_map = mapping
+    _user_period_map = periods
     return _user_map
 
 
@@ -728,6 +741,34 @@ def simpan_user(user_id, username, spreadsheet_id):
 
 def get_spreadsheet_id(user_id):
     return load_user_map().get(str(user_id))
+
+
+def get_awal_periode(user_id):
+    load_user_map()
+    return _user_period_map.get(str(user_id))
+
+
+def simpan_awal_periode(user_id, hari):
+    """Simpan tanggal awal periode dan tulis ulang formula dashboard user."""
+    hari = int(hari)
+    if not 1 <= hari <= 28:
+        raise ValueError("Tanggal awal periode harus 1 sampai 28")
+    ws_users = get_users_sheet()
+    cell = ws_users.find(str(user_id), in_column=1)
+    if not cell:
+        raise ValueError("User belum terdaftar")
+    ws_users.update(f"E{cell.row}", [[hari]], value_input_option="USER_ENTERED")
+    load_user_map(force=True)
+
+    sid = get_spreadsheet_id(user_id)
+    ss = get_client().open_by_key(sid)
+    try:
+        ws_dash = ss.worksheet(SHEET_DASHBOARD)
+    except gspread.WorksheetNotFound:
+        ws_dash = ss.add_worksheet(title=SHEET_DASHBOARD, rows=300, cols=14)
+    sep, colsep = deteksi_pemisah(ss)
+    _isi_dashboard(ws_dash, sep, colsep, hari)
+    _rapikan_dashboard(ss, ws_dash)
 
 
 # ------------------------------------------
@@ -821,6 +862,7 @@ def simpan_pemasukan(user_id, tanggal, kategori, nominal, sumber, catatan):
 # tidak saling menimpa (bug versi sebelumnya).
 # ==========================================
 pending = {}  # token -> dict data
+media_groups = {}  # media_group_id -> kumpulan foto album Telegram
 
 
 def buat_token(data):
@@ -935,10 +977,115 @@ def keyboard_utama():
     )
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def _tanggal_gajian_aktual(tahun, bulan, hari, tanggal_libur=None):
+    """Majukan tanggal target ke hari kerja sebelumnya bila libur/weekend."""
+    tanggal_libur = set(tanggal_libur or [])
+    target = datetime(tahun, bulan, hari, tzinfo=WIB)
+    while target.weekday() >= 5 or target.strftime("%Y-%m-%d") in tanggal_libur:
+        target -= timedelta(days=1)
+    return target
+
+
+def get_tanggal_libur_user(user_id):
+    """Ambil tanggal merah/cuti bersama user; gagal baca dianggap daftar kosong."""
+    sid = get_spreadsheet_id(user_id)
+    if not sid:
+        return set()
+    try:
+        ws = get_client().open_by_key(sid).worksheet(SHEET_KALENDER_LIBUR)
+        hasil = set()
+        for value in ws.col_values(1)[1:]:
+            value = str(value).strip()
+            try:
+                hasil.add(datetime.strptime(value[:10], "%Y-%m-%d").strftime("%Y-%m-%d"))
+            except ValueError:
+                continue
+        return hasil
+    except Exception as e:
+        logger.warning(f"Gagal membaca kalender libur user {user_id}: {e}")
+        return set()
+
+
+def rentang_periode_berjalan(hari, acuan=None, tanggal_libur=None):
+    """Awal/akhir periode berdasarkan hari kerja dan kalender libur user."""
+    hari = max(1, min(28, int(hari)))
+    acuan = acuan or now_wib()
+    libur = set(tanggal_libur or [])
+    bulan_ini = _tanggal_gajian_aktual(acuan.year, acuan.month, hari, libur)
+    if acuan.date() >= bulan_ini.date():
+        mulai = bulan_ini
+        ref_depan = acuan.replace(day=28) + timedelta(days=4)
+        bulan_berikut = _tanggal_gajian_aktual(
+            ref_depan.year, ref_depan.month, hari, libur
+        )
+    else:
+        akhir_bulan_lalu = acuan.replace(day=1) - timedelta(days=1)
+        mulai = _tanggal_gajian_aktual(
+            akhir_bulan_lalu.year, akhir_bulan_lalu.month, hari, libur
+        )
+        bulan_berikut = bulan_ini
+    selesai = bulan_berikut - timedelta(days=1)
+    return mulai.strftime("%Y-%m-%d"), selesai.strftime("%Y-%m-%d")
+
+
+async def setperiode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not get_spreadsheet_id(user_id):
         await update.message.reply_text(pesan_belum_daftar(), parse_mode="Markdown")
+        return
+    arg = " ".join(context.args).strip()
+    if not arg:
+        menunggu_periode.add(user_id)
+        saat_ini = get_awal_periode(user_id)
+        info = f" Saat ini tanggal *{saat_ini}*." if saat_ini else ""
+        await update.message.reply_text(
+            f"📅 Periode mau dimulai tanggal berapa setiap bulan?{info}\n"
+            "Kirim angka *1–28*.",
+            parse_mode="Markdown",
+        )
+        return
+    try:
+        hari = int(arg)
+        if not 1 <= hari <= 28:
+            raise ValueError
+        simpan_awal_periode(user_id, hari)
+        mulai, selesai = rentang_periode_berjalan(
+            hari, tanggal_libur=get_tanggal_libur_user(user_id)
+        )
+        await update.message.reply_text(
+            f"✅ Tanggal acuan gajian diatur ke *{hari}*.\n"
+            f"Periode berjalan: *{mulai} sampai {selesai}*.",
+            parse_mode="Markdown",
+        )
+    except ValueError:
+        await update.message.reply_text(
+            "⚠️ Format: `/setperiode 25` dengan angka 1–28.", parse_mode="Markdown"
+        )
+    except Exception as e:
+        logger.error(f"Gagal ubah periode {user_id}: {e}")
+        await update.message.reply_text("❌ Gagal mengubah periode. Coba lagi sebentar.")
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not get_spreadsheet_id(user_id):
+        menunggu_periode.add(user_id)
+        await update.message.reply_text(
+            "👋 Selamat datang! Sebelum mulai, periode keuanganmu dimulai "
+            "setiap tanggal berapa?\n\n"
+            "Kirim angka *1–28*. Contoh: `25` jika kamu biasa gajian tanggal 25.",
+            parse_mode="Markdown",
+        )
+        return
+    if get_awal_periode(user_id) is None:
+        menunggu_periode.add(user_id)
+        await update.message.reply_text(
+            "📅 Supaya laporan mengikuti siklus gajianmu, periode keuangan "
+            "dimulai setiap tanggal berapa?\n\n"
+            "Kirim angka *1–28*. Contoh: `25` jika kamu biasa gajian tanggal 25.",
+            parse_mode="Markdown",
+            reply_markup=keyboard_utama(),
+        )
         return
     await update.message.reply_text(
         "👋 Halo! Saya bot pencatat keuangan kamu.\n\n"
@@ -986,7 +1133,7 @@ async def _proses_daftar(update, spreadsheet_id, user):
         rapikan_header(ss, ws_in, len(HEADER_PEMASUKAN),
                        {"red": 0.13, "green": 0.42, "blue": 0.31})   # hijau tua
         setup_kalender_libur(ss)
-        ws_dash, _ = setup_dashboard(ss)
+        ws_dash, _ = setup_dashboard(ss, 1)
         setup_grafik(ss, ws_dash.id)
         hapus_sheet_bawaan(ss)
     except gspread.SpreadsheetNotFound:
@@ -1008,6 +1155,9 @@ async def _proses_daftar(update, spreadsheet_id, user):
 
     try:
         simpan_user(user.id, user.username, spreadsheet_id)
+        periode_pilihan = pilihan_periode_sementara.pop(user.id, None)
+        if periode_pilihan:
+            simpan_awal_periode(user.id, periode_pilihan)
     except Exception as e:
         logger.error(f"Gagal simpan user {user.id}: {e}")
         await update.message.reply_text(
@@ -1016,18 +1166,27 @@ async def _proses_daftar(update, spreadsheet_id, user):
         )
         return
 
+    periode_pilihan = get_awal_periode(user.id)
+    lanjutan = (
+        f"📅 Tanggal acuan gajian: *{periode_pilihan}* "
+        f"(dimajukan bila libur/weekend).\n\n"
+        f"Coba sekarang:\n`/catat 15000 Makan nasi goreng`"
+        if periode_pilihan else
+        "Sekarang tentukan dulu tanggal awal periode keuanganmu (1–28). "
+        "Contoh: kirim `25` jika kamu biasa gajian tanggal 25."
+    )
     await update.message.reply_text(
         f"✅ *Berhasil terhubung!*\n\n"
         f"📄 Spreadsheet: *{judul}*\n"
         f"📑 Sheet *{SHEET_PENGELUARAN}*, *{SHEET_PEMASUKAN}*, "
         f"*{SHEET_DASHBOARD}*, *{SHEET_GRAFIK}*, dan *{SHEET_KALENDER_LIBUR}* sudah siap.\n\n"
-        f"📅 Isi tanggal merah/cuti bersama (format YYYY-MM-DD) di sheet *{SHEET_KALENDER_LIBUR}*. "
-        f"Tanggal gajian akan otomatis memakai hari kerja terakhir sebelum tanggal 25.\n\n"
         f"📊 Dashboard akan terisi sendiri begitu ada transaksi.\n\n"
-        f"Coba sekarang:\n`/catat 15000 Makan nasi goreng`",
+        f"{lanjutan}",
         parse_mode="Markdown",
         reply_markup=keyboard_utama(),
     )
+    if not periode_pilihan:
+        menunggu_periode.add(user.id)
 
 
 # ==========================================
@@ -1116,6 +1275,45 @@ async def terima_teks(update: Update, context: ContextTypes.DEFAULT_TYPE):
        4) sudah daftar -> coba pahami sebagai pencatatan belanja bebas."""
     user_id = update.effective_user.id
     teks = (update.message.text or "").strip()
+
+    # Onboarding/penggantian tanggal awal periode.
+    if user_id in menunggu_periode:
+        try:
+            hari = int(teks)
+            if not 1 <= hari <= 28:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text(
+                "⚠️ Kirim satu angka dari *1 sampai 28*. Contoh: `25`.",
+                parse_mode="Markdown",
+            )
+            return
+        if not get_spreadsheet_id(user_id):
+            pilihan_periode_sementara[user_id] = hari
+            menunggu_periode.discard(user_id)
+            await update.message.reply_text(
+                f"✅ Periode akan dimulai setiap tanggal *{hari}*.\n\n" +
+                pesan_belum_daftar(),
+                parse_mode="Markdown",
+            )
+            return
+        try:
+            simpan_awal_periode(user_id, hari)
+            menunggu_periode.discard(user_id)
+            mulai, selesai = rentang_periode_berjalan(
+                hari, tanggal_libur=get_tanggal_libur_user(user_id)
+            )
+            await update.message.reply_text(
+                f"✅ Tanggal acuan gajian diatur ke *{hari}*.\n"
+                f"Periode berjalan: *{mulai} sampai {selesai}*.\n\n"
+                "Pengaturan ini bisa diubah kapan saja dengan `/setperiode 25`.",
+                parse_mode="Markdown",
+                reply_markup=keyboard_utama(),
+            )
+        except Exception as e:
+            logger.error(f"Gagal simpan periode {user_id}: {e}")
+            await update.message.reply_text("❌ Gagal menyimpan periode. Coba lagi sebentar.")
+        return
 
     # 0. Sedang mode ketik tanggal manual (dari peringatan struk tanggal-tua)?
     if user_id in menunggu_tanggal:
@@ -1325,14 +1523,15 @@ async def perbaruidashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ws = ss.add_worksheet(title=SHEET_DASHBOARD, rows=300, cols=14)
 
         sep, colsep = deteksi_pemisah(ss)
-        _isi_dashboard(ws, sep, colsep)
+        awal_periode = get_awal_periode(update.effective_user.id) or 1
+        _isi_dashboard(ws, sep, colsep, awal_periode)
 
         # Verifikasi: kalau sel bantuan K1 error, berarti tebakan pemisah salah.
         try:
             cek = ws.acell("K1", value_render_option="UNFORMATTED_VALUE").value
             if isinstance(cek, str) and cek.startswith("#"):
                 alt = (";", "\\") if sep == "," else (",", ",")
-                _isi_dashboard(ws, alt[0], alt[1])
+                _isi_dashboard(ws, alt[0], alt[1], awal_periode)
         except Exception as e:
             logger.error(f"Gagal verifikasi formula dashboard: {e}")
 
@@ -1801,7 +2000,13 @@ Aturan:
 
 
 async def rekap(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    periode = " ".join(context.args).strip() or "hari ini"
+    periode = " ".join(context.args).strip()
+    if not periode:
+        hari = get_awal_periode(update.effective_user.id) or 1
+        mulai, selesai = rentang_periode_berjalan(
+            hari, tanggal_libur=get_tanggal_libur_user(update.effective_user.id)
+        )
+        periode = f"{mulai} sampai {selesai}"
     await _proses_rekap(update, periode, update.effective_user.id)
 
 
@@ -1826,10 +2031,50 @@ async def terima_foto(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(pesan_belum_daftar(), parse_mode="Markdown")
         return
 
+    # Telegram mengirim album sebagai beberapa update. Kumpulkan sebentar agar
+    # caption pada gambar pertama berlaku untuk seluruh gambar di album.
+    group_id = update.message.media_group_id
+    if group_id:
+        grup = media_groups.setdefault(group_id, {"items": [], "caption": "", "task": None})
+        grup["items"].append((update, photo_id))
+        if caption:
+            grup["caption"] = caption
+        if grup["task"] is None:
+            grup["task"] = context.application.create_task(
+                _proses_album_foto(group_id, context),
+                name=f"album-{group_id}",
+            )
+        return
+
     await update.message.reply_text("📸 Struk diterima, sedang dibaca...")
     photo_file = await update.message.photo[-1].get_file()
     photo_bytes = await photo_file.download_as_bytearray()
     await proses_struk(update, context, bytes(photo_bytes), "image/jpeg", caption)
+
+
+async def _proses_album_foto(group_id, context):
+    await asyncio.sleep(1.2)
+    grup = media_groups.pop(group_id, None)
+    if not grup or not grup["items"]:
+        return
+    items = grup["items"]
+    caption = grup["caption"]
+    update_utama = items[0][0]
+    await update_utama.message.reply_text(
+        f"📸 {len(items)} gambar diterima, sedang dibaca sebagai satu kelompok..."
+    )
+    for item_update, photo_id in items:
+        try:
+            photo_file = await context.bot.get_file(photo_id)
+            photo_bytes = await photo_file.download_as_bytearray()
+            await proses_struk(
+                item_update, context, bytes(photo_bytes), "image/jpeg", caption
+            )
+        except Exception as e:
+            logger.error(f"Gagal membaca gambar album {group_id}: {e}")
+            await update_utama.message.reply_text(
+                "⚠️ Salah satu gambar di album gagal dibaca. Gambar lainnya tetap diproses."
+            )
 
 
 async def terima_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1864,8 +2109,141 @@ async def terima_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await proses_struk(update, context, bytes(pdf_bytes), "application/pdf", caption)
 
 
+def parse_caption_transaksi(caption):
+    """Ambil instruksi masuk/keluar di awal caption dan catatan sisanya."""
+    caption = (caption or "").strip()
+    m = re.match(r"^/?(masuk|keluar)(?:\s+|$)(.*)$", caption, re.I | re.S)
+    if not m:
+        return None, caption
+    return ("pemasukan" if m.group(1).lower() == "masuk" else "pengeluaran"), m.group(2).strip()
+
+
+def _angka_nominal(value):
+    if isinstance(value, (int, float)):
+        return int(value)
+    angka = re.sub(r"[^0-9]", "", str(value or ""))
+    return int(angka) if angka else 0
+
+
+def _teks_hasil_bukti(data, judul="Hasil baca bukti"):
+    jenis = "Pemasukan" if data.get("jenis") == "pemasukan" else "Pengeluaran"
+    pihak_label = "Pengirim/Sumber" if jenis == "Pemasukan" else "Merchant/Tujuan"
+    pihak = data.get("merchant") or "-"
+    return (
+        f"📋 *{judul}:*\n\n"
+        f"↕️ Jenis: *{jenis}*\n"
+        f"🏪 {pihak_label}: {pihak}\n"
+        f"📅 Tanggal: {data['tanggal']}\n"
+        f"🏷️ Kategori: {data.get('kategori') or '-'}\n"
+        f"💰 Nominal: Rp{data['nominal']:,}\n"
+        f"📝 Catatan: {data.get('catatan') or '-'}\n\n"
+        "Simpan data ini?"
+    )
+
+
+async def proses_bukti_baru(update, file_bytes, mime_type, caption):
+    """OCR struk, bukti transfer, dan screenshot notifikasi menjadi transaksi."""
+    user_id = update.effective_user.id
+    hari_ini = now_wib().strftime("%Y-%m-%d")
+    paksa_jenis, catatan_caption = parse_caption_transaksi(caption)
+    instruksi_jenis = (
+        f'Semua hasil WAJIB berjenis "{paksa_jenis}" karena user memberi caption.'
+        if paksa_jenis else
+        'Untuk struk biasa gunakan "pengeluaran". Untuk notifikasi, judul "Transaksi Berhasil" '
+        'berarti pengeluaran dan "Transaksi Diterima" berarti pemasukan.'
+    )
+    prompt = f"""
+    Kamu membaca struk, bukti transfer, atau screenshot notifikasi bank.
+    Hari ini {hari_ini}. {instruksi_jenis}
+    Ekstrak SETIAP transaksi yang terlihat. Notifikasi berbeda dalam satu screenshot
+    adalah transaksi berbeda. Abaikan teks saldo dan elemen antarmuka yang bukan transaksi.
+    Balas JSON saja tanpa markdown:
+    {{"transaksi":[{{
+      "jenis":"pemasukan atau pengeluaran",
+      "tipe_dokumen":"struk atau bukti_transfer atau notifikasi",
+      "judul":"judul notifikasi jika ada",
+      "merchant":"nama toko, pengirim, atau tujuan; '-' jika tidak ada",
+      "tanggal":"YYYY-MM-DD; gunakan {hari_ini} jika tidak terlihat",
+      "nominal":12345,
+      "items":"daftar barang dipisah koma atau kosong",
+      "kategori":"Makan, Donasi, Transport, Belanja, Hiburan, Tagihan, Investasi, Tabungan, atau Lainnya"
+    }}]}}
+    Jika tidak ada transaksi jelas, kembalikan {{"transaksi":[]}}.
+    Ambil nominal transaksi, bukan saldo. Jangan menduplikasi notifikasi yang sama persis.
+    """
+    response = gemini_model.generate_content(
+        [prompt, {"mime_type": mime_type, "data": file_bytes}]
+    )
+    teks = re.sub(r"^```json\s*|\s*```$", "", response.text.strip()).strip()
+    payload = json.loads(teks)
+    hasil_list = payload.get("transaksi", []) if isinstance(payload, dict) else []
+    if not hasil_list:
+        await update.message.reply_text(
+            "⚠️ Tidak menemukan transaksi yang bisa dibaca. Coba kirim gambar lebih jelas "
+            "atau catat manual dengan `/catat` atau `/masuk`.",
+            parse_mode="Markdown",
+        )
+        return
+
+    dibuat = 0
+    for hasil in hasil_list[:20]:
+        nominal = _angka_nominal(hasil.get("nominal"))
+        if nominal <= 0:
+            continue
+        jenis_ai = str(hasil.get("jenis", "")).lower()
+        jenis = paksa_jenis or ("pemasukan" if jenis_ai == "pemasukan" else "pengeluaran")
+        tipe_dokumen = str(hasil.get("tipe_dokumen", "struk")).lower()
+        sumber = "Notifikasi" if tipe_dokumen == "notifikasi" else (
+            "Bukti transfer" if tipe_dokumen == "bukti_transfer" else "Struk"
+        )
+        merchant = str(hasil.get("merchant") or "-").strip()
+        catatan = catatan_caption
+        if sumber == "Notifikasi" and not catatan:
+            catatan = str(hasil.get("judul") or "").strip()
+        data = {
+            "user_id": user_id,
+            "jenis": jenis,
+            "tanggal": tanggal_struk_valid(hasil.get("tanggal"), hari_ini),
+            "kategori": (
+                "Transfer Masuk" if jenis == "pemasukan" else
+                normalkan_kategori(hasil.get("kategori", "Lainnya"), merchant, paksa=True)
+            ),
+            "barang": str(hasil.get("items") or "").strip(),
+            "nominal": nominal,
+            "merchant": merchant,
+            "sumber": sumber,
+            "catatan": catatan,
+        }
+        token = buat_token(data)
+        dibuat += 1
+        if tanggal_terlalu_tua(data["tanggal"], hari_ini):
+            await update.message.reply_text(
+                _teks_hasil_bukti(data, "Cek tanggal dulu") +
+                "\nTanggal terlihat lebih dari 45 hari lalu. Apakah benar?",
+                parse_mode="Markdown",
+                reply_markup=keyboard_struk_tanggal_tua(token),
+            )
+        else:
+            await update.message.reply_text(
+                _teks_hasil_bukti(data),
+                parse_mode="Markdown",
+                reply_markup=keyboard_konfirmasi_struk(token),
+            )
+    if not dibuat:
+        await update.message.reply_text("⚠️ Nominal transaksi tidak terbaca dengan jelas.")
+
+
 async def proses_struk(update: Update, context: ContextTypes.DEFAULT_TYPE, file_bytes: bytes, mime_type: str, caption: str):
     """Inti pembacaan struk lewat Gemini, dipakai bareng oleh jalur foto (image/jpeg) dan PDF (application/pdf)."""
+    try:
+        await proses_bukti_baru(update, file_bytes, mime_type, caption)
+    except Exception as e:
+        logger.error(f"Gagal proses bukti: {e}")
+        await update.message.reply_text(
+            "❌ Gagal membaca bukti transaksi. Coba lagi atau catat manual."
+        )
+    return
+
     user_id = update.effective_user.id
     hari_ini = now_wib().strftime("%Y-%m-%d")
 
@@ -2075,13 +2453,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if aksi == "struk_hariini":
         data["tanggal"] = now_wib().strftime("%Y-%m-%d")
         await query.edit_message_text(
-            f"📋 *Hasil baca struk:* (tanggal diganti ke hari ini)\n\n"
-            f"🏪 Merchant: {data['merchant']}\n"
-            f"📅 Tanggal: {data['tanggal']}\n"
-            f"🏷️ Kategori: {data['kategori']}\n"
-            f"💰 Nominal: Rp{data['nominal']:,}\n"
-            f"📝 Catatan: {data.get('catatan') or '-'}\n\n"
-            f"Simpan data ini?",
+            _teks_hasil_bukti(data, "Tanggal diganti ke hari ini"),
             parse_mode="Markdown",
             reply_markup=keyboard_konfirmasi_struk(token),
         )
@@ -2090,13 +2462,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if aksi == "struk_kemarin":
         data["tanggal"] = (now_wib() - timedelta(days=1)).strftime("%Y-%m-%d")
         await query.edit_message_text(
-            f"📋 *Hasil baca struk:* (tanggal diganti ke kemarin)\n\n"
-            f"🏪 Merchant: {data['merchant']}\n"
-            f"📅 Tanggal: {data['tanggal']}\n"
-            f"🏷️ Kategori: {data['kategori']}\n"
-            f"💰 Nominal: Rp{data['nominal']:,}\n"
-            f"📝 Catatan: {data.get('catatan') or '-'}\n\n"
-            f"Simpan data ini?",
+            _teks_hasil_bukti(data, "Tanggal diganti ke kemarin"),
             parse_mode="Markdown",
             reply_markup=keyboard_konfirmasi_struk(token),
         )
@@ -2120,6 +2486,17 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # --- Konfirmasi struk, lanjut pilih tipe bayar ---
     if aksi == "struk_simpan":
+        if data.get("jenis") == "pemasukan":
+            await query.edit_message_text(
+                f"📥 *Detail Pemasukan:*\n\n"
+                f"📅 {data['tanggal']}\n"
+                f"💰 Rp{data['nominal']:,}\n"
+                f"📝 {data.get('catatan') or '-'}\n\n"
+                "Pilih kategori pemasukan:",
+                parse_mode="Markdown",
+                reply_markup=keyboard_kategori_pemasukan(token),
+            )
+            return
         await query.edit_message_text(
             f"📋 *Detail Pengeluaran:*\n\n"
             f"🏪 Merchant: {data['merchant']}\n"
@@ -2184,8 +2561,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 tanggal=data["tanggal"],
                 kategori=kategori,
                 nominal=data["nominal"],
-                sumber="Manual",
-                catatan=data.get("catatan", ""),
+                sumber=data.get("sumber", "Manual"),
+                catatan=(
+                    ((data.get("merchant") or "") +
+                     (" — " if data.get("merchant") not in (None, "", "-") and data.get("catatan") else "") +
+                     (data.get("catatan") or "")).strip()
+                ),
             )
             pending.pop(token, None)
             await query.edit_message_text(
@@ -2283,12 +2664,16 @@ async def tanya(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         hari_ini = now_wib().strftime("%Y-%m-%d")
+        awal_periode = get_awal_periode(user_id) or 1
+        mulai_periode, akhir_periode = rentang_periode_berjalan(
+            awal_periode, tanggal_libur=get_tanggal_libur_user(user_id)
+        )
         prompt = f"""Kamu asisten keuangan pribadi. Hari ini {hari_ini}.
 Di bawah ini data transaksi user, satu baris per transaksi dengan format:
 tanggal|OUT/IN|kategori|nominal|merchant|catatan|tipe_bayar
 OUT = pengeluaran, IN = pemasukan. Nominal dalam Rupiah.
-Siklus periode keuangan dimulai pada tanggal gajian aktual: tanggal 25, atau
-hari kerja sebelumnya jika tanggal 25 jatuh pada akhir pekan/libur/cuti bersama.
+Siklus periode keuangan user dimulai setiap tanggal {awal_periode}.
+Periode yang sedang berjalan adalah {mulai_periode} sampai {akhir_periode}.
 
 DATA:
 {data}
@@ -2334,13 +2719,19 @@ TEKS_FITUR = (
     "💵 *Catat pemasukan*\n"
     "`/masuk 5000000 Gaji`\n\n"
     "📸 *Foto struk otomatis*\n"
-    "Kirim foto struk, dibaca sendiri (termasuk daftar barang).\n"
-    "• *Caption* jadi catatan.\n"
+    "Kirim satu foto atau album; semua transaksi akan dibaca.\n"
+    "• Caption `masuk` → bukti dicatat sebagai pemasukan.\n"
+    "• Caption `keluar` → bukti dicatat sebagai pengeluaran.\n"
+    "• Bisa ditambah catatan, mis. `masuk pembayaran proyek`.\n"
+    "• Screenshot notifikasi: *Transaksi Diterima* = masuk, *Transaksi Berhasil* = keluar.\n"
     "• Struk yang sama otomatis ditolak agar transaksi tidak dobel.\n"
     "• Caption berupa pertanyaan (mis. \"sudah pernah diupload?\") → bot cek duplikat dulu.\n\n"
     "📊 *Rekap transaksi*\n"
-    "`/rekap hari ini` · `/rekap 1 agustus 2026` · `/rekap bulan ini`\n"
+    "`/rekap` (periode berjalan) · `/rekap hari ini` · `/rekap bulan ini`\n"
     "• Bisa disaring tipe bayar → \"rekap bulan ini paylater\"\n\n"
+    "📅 *Atur periode keuangan*\n"
+    "`/setperiode 25` → tanggal 25 menjadi acuan; jika libur/weekend, "
+    "awal periode maju ke hari kerja sebelumnya.\n\n"
     "🤖 *Tanya AI* soal keuanganmu\n"
     "`/tanya berapa kali saya ngopi minggu ini`\n"
     "`/tanya beri saran biar lebih hemat`\n\n"
@@ -2395,6 +2786,8 @@ async def umumkan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==========================================
 menunggu_saran = set()   # user_id yang sedang diminta mengetik saran
 menunggu_tanggal = {}    # user_id -> token, sedang diminta mengetik tanggal struk
+menunggu_periode = set() # user_id sedang diminta memilih tanggal awal periode
+pilihan_periode_sementara = {}  # disimpan sampai spreadsheet selesai dihubungkan
 
 
 async def _teruskan_saran(update, context, teks="", photo_id=None):
@@ -2446,6 +2839,9 @@ async def batal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif uid in menunggu_tanggal:
         menunggu_tanggal.pop(uid, None)
         await update.message.reply_text("Dibatalkan. 👍")
+    elif uid in menunggu_periode:
+        menunggu_periode.discard(uid)
+        await update.message.reply_text("Pengaturan periode dibatalkan. 👍")
     else:
         await update.message.reply_text("Tidak ada yang perlu dibatalkan.")
 
@@ -2521,6 +2917,7 @@ def main():
     app.add_handler(CommandHandler("buatkan", buatkan))
     app.add_handler(CommandHandler("info", info))
     app.add_handler(CommandHandler("perbaruidashboard", perbaruidashboard))
+    app.add_handler(CommandHandler("setperiode", setperiode))
     app.add_handler(CommandHandler("catat", catat_manual))
     app.add_handler(CommandHandler("masuk", catat_masuk))
     app.add_handler(CommandHandler("hapus", hapus))
