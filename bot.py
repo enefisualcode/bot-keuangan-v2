@@ -977,6 +977,16 @@ def pesan_cara_manual():
     )
 
 
+def pesan_minta_link_spreadsheet():
+    return (
+        "📊 Sekarang masukkan *link Google Sheet* yang akan dipakai untuk pencatatan.\n\n"
+        "Sebelum mengirim link, buka menu *Bagikan* dan beri email berikut akses "
+        "sebagai *Editor*:\n"
+        f"`{SERVICE_ACCOUNT_EMAIL}`\n\n"
+        "Setelah itu, tempel link Google Sheet-nya di sini."
+    )
+
+
 # ==========================================
 # HANDLER: /start
 # ==========================================
@@ -1309,7 +1319,7 @@ async def terima_teks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             menunggu_periode.discard(user_id)
             await update.message.reply_text(
                 f"✅ Periode akan dimulai setiap tanggal *{hari}*.\n\n" +
-                pesan_belum_daftar(),
+                pesan_minta_link_spreadsheet(),
                 parse_mode="Markdown",
             )
             return
