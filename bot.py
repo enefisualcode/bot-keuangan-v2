@@ -1071,8 +1071,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not get_spreadsheet_id(user_id):
         menunggu_periode.add(user_id)
         await update.message.reply_text(
-            "👋 Selamat datang! Sebelum mulai, periode keuanganmu dimulai "
-            "setiap tanggal berapa?\n\n"
+            "👋 Selamat datang! Pencatatan kamu mau mulai dari tanggal berapa?\n\n"
             "Kirim angka *1–28*. Contoh: `25` jika kamu biasa gajian tanggal 25.",
             parse_mode="Markdown",
         )
@@ -1080,8 +1079,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if get_awal_periode(user_id) is None:
         menunggu_periode.add(user_id)
         await update.message.reply_text(
-            "📅 Supaya laporan mengikuti siklus gajianmu, periode keuangan "
-            "dimulai setiap tanggal berapa?\n\n"
+            "📅 Pencatatan kamu mau mulai dari tanggal berapa?\n\n"
             "Kirim angka *1–28*. Contoh: `25` jika kamu biasa gajian tanggal 25.",
             parse_mode="Markdown",
             reply_markup=keyboard_utama(),
