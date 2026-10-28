@@ -27,6 +27,7 @@ import uuid
 import asyncio
 import time
 import socket
+import calendar
 import requests
 from datetime import datetime, timedelta, timezone
 
@@ -306,10 +307,10 @@ T_LABEL_PERIODE = '=TEXT($K$2~"d mmm")&" - "&TEXT($K$3~"d mmm yyyy")'
 
 def _formula_periode(awal_periode):
     """Formula periode; tanggal target dimajukan ke hari kerja sebelumnya."""
-    hari = max(1, min(28, int(awal_periode)))
-    bulan_ini = f'WORKDAY.INTL(DATE(YEAR(TODAY())~MONTH(TODAY())~{hari + 1})~-1~1~{_LIBUR})'
-    bulan_lalu = f'WORKDAY.INTL(DATE(YEAR(TODAY())~MONTH(TODAY())-1~{hari + 1})~-1~1~{_LIBUR})'
-    bulan_depan = f'WORKDAY.INTL(DATE(YEAR(TODAY())~MONTH(TODAY())+1~{hari + 1})~-1~1~{_LIBUR})'
+    hari = max(1, min(31, int(awal_periode)))
+    bulan_ini = _formula_gajian_aktual("TODAY()", 0, hari)
+    bulan_lalu = _formula_gajian_aktual("TODAY()", -1, hari)
+    bulan_depan = _formula_gajian_aktual("TODAY()", 1, hari)
     mulai = f'=IF(TODAY()>={bulan_ini}~{bulan_ini}~{bulan_lalu})'
     selesai = f'=IF(TODAY()>={bulan_ini}~{bulan_depan}-1~{bulan_ini}-1)'
     return mulai, selesai
@@ -317,14 +318,27 @@ def _formula_periode(awal_periode):
 
 def _t_helper(sheet, awal_periode=25):
     """Label periode untuk tiap transaksi sesuai tanggal awal pilihan user."""
-    hari = max(1, min(28, int(awal_periode)))
+    hari = max(1, min(31, int(awal_periode)))
     d = f"{sheet}!A2:A5000"
-    payday = f'WORKDAY.INTL(DATE(YEAR({d})~MONTH({d})~{hari + 1})~-1~1~{_LIBUR})'
-    payday_prev = f'WORKDAY.INTL(DATE(YEAR({d})~MONTH({d})-1~{hari + 1})~-1~1~{_LIBUR})'
+    payday = _formula_gajian_aktual(d, 0, hari)
+    payday_prev = _formula_gajian_aktual(d, -1, hari)
     return (
         '=ARRAYFORMULA(IF({s}!A2:A5000=""~""~'
         'TEXT(IF({s}!A2:A5000>={payday}~{payday}~{payday_prev})~"YYYY-MM")))'
     ).format(s=sheet, payday=payday, payday_prev=payday_prev)
+
+
+def _formula_gajian_aktual(acuan, offset_bulan, hari):
+    """Formula tanggal periode: tanggal 1 tetap; 2–31 mengikuti hari kerja."""
+    offset = f"{offset_bulan:+d}" if offset_bulan else ""
+    awal_bulan = f'DATE(YEAR({acuan})~MONTH({acuan}){offset}~1)'
+    if hari == 1:
+        return awal_bulan
+    target = (
+        f'DATE(YEAR({acuan})~MONTH({acuan}){offset}~'
+        f'MIN({hari}~DAY(EOMONTH({awal_bulan}~0))))'
+    )
+    return f'WORKDAY.INTL({target}+1~-1~1~{_LIBUR})'
 
 
 def deteksi_pemisah(ss):
@@ -705,7 +719,7 @@ def load_user_map(force=False):
                 mapping[uid] = sid
                 try:
                     hari = int(r.get("awal_periode", 0))
-                    if 1 <= hari <= 28:
+                    if 1 <= hari <= 31:
                         periods[uid] = hari
                 except (TypeError, ValueError):
                     pass
@@ -751,8 +765,8 @@ def get_awal_periode(user_id):
 def simpan_awal_periode(user_id, hari):
     """Simpan tanggal awal periode dan tulis ulang formula dashboard user."""
     hari = int(hari)
-    if not 1 <= hari <= 28:
-        raise ValueError("Tanggal awal periode harus 1 sampai 28")
+    if not 1 <= hari <= 31:
+        raise ValueError("Tanggal awal periode harus 1 sampai 31")
     ws_users = get_users_sheet()
     cell = ws_users.find(str(user_id), in_column=1)
     if not cell:
@@ -980,7 +994,11 @@ def keyboard_utama():
 def _tanggal_gajian_aktual(tahun, bulan, hari, tanggal_libur=None):
     """Majukan tanggal target ke hari kerja sebelumnya bila libur/weekend."""
     tanggal_libur = set(tanggal_libur or [])
+    hari = min(int(hari), calendar.monthrange(tahun, bulan)[1])
     target = datetime(tahun, bulan, hari, tzinfo=WIB)
+    # Tanggal 1 berarti bulan kalender penuh, bukan siklus gajian bergeser.
+    if hari == 1:
+        return target
     while target.weekday() >= 5 or target.strftime("%Y-%m-%d") in tanggal_libur:
         target -= timedelta(days=1)
     return target
@@ -1008,7 +1026,7 @@ def get_tanggal_libur_user(user_id):
 
 def rentang_periode_berjalan(hari, acuan=None, tanggal_libur=None):
     """Awal/akhir periode berdasarkan hari kerja dan kalender libur user."""
-    hari = max(1, min(28, int(hari)))
+    hari = max(1, min(31, int(hari)))
     acuan = acuan or now_wib()
     libur = set(tanggal_libur or [])
     bulan_ini = _tanggal_gajian_aktual(acuan.year, acuan.month, hari, libur)
@@ -1040,13 +1058,13 @@ async def setperiode(update: Update, context: ContextTypes.DEFAULT_TYPE):
         info = f" Saat ini tanggal *{saat_ini}*." if saat_ini else ""
         await update.message.reply_text(
             f"📅 Periode mau dimulai tanggal berapa setiap bulan?{info}\n"
-            "Kirim angka *1–28*.",
+            "Kirim angka *1–31*.",
             parse_mode="Markdown",
         )
         return
     try:
         hari = int(arg)
-        if not 1 <= hari <= 28:
+        if not 1 <= hari <= 31:
             raise ValueError
         simpan_awal_periode(user_id, hari)
         mulai, selesai = rentang_periode_berjalan(
@@ -1059,7 +1077,7 @@ async def setperiode(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except ValueError:
         await update.message.reply_text(
-            "⚠️ Format: `/setperiode 25` dengan angka 1–28.", parse_mode="Markdown"
+            "⚠️ Format: `/setperiode 25` dengan angka 1–31.", parse_mode="Markdown"
         )
     except Exception as e:
         logger.error(f"Gagal ubah periode {user_id}: {e}")
@@ -1072,7 +1090,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         menunggu_periode.add(user_id)
         await update.message.reply_text(
             "👋 Selamat datang! Pencatatan kamu mau mulai dari tanggal berapa?\n\n"
-            "Kirim angka *1–28*. Contoh: `25` jika kamu biasa gajian tanggal 25.",
+            "Kirim angka *1–31*. Pilih `1` untuk satu bulan penuh, atau `25` jika gajian tanggal 25.",
             parse_mode="Markdown",
         )
         return
@@ -1080,7 +1098,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         menunggu_periode.add(user_id)
         await update.message.reply_text(
             "📅 Pencatatan kamu mau mulai dari tanggal berapa?\n\n"
-            "Kirim angka *1–28*. Contoh: `25` jika kamu biasa gajian tanggal 25.",
+            "Kirim angka *1–31*. Pilih `1` untuk satu bulan penuh, atau `25` jika gajian tanggal 25.",
             parse_mode="Markdown",
             reply_markup=keyboard_utama(),
         )
@@ -1170,7 +1188,7 @@ async def _proses_daftar(update, spreadsheet_id, user):
         f"(dimajukan bila libur/weekend).\n\n"
         f"Coba sekarang:\n`/catat 15000 Makan nasi goreng`"
         if periode_pilihan else
-        "Sekarang tentukan dulu tanggal awal periode keuanganmu (1–28). "
+        "Sekarang tentukan dulu tanggal awal periode keuanganmu (1–31). "
         "Contoh: kirim `25` jika kamu biasa gajian tanggal 25."
     )
     await update.message.reply_text(
@@ -1278,11 +1296,11 @@ async def terima_teks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id in menunggu_periode:
         try:
             hari = int(teks)
-            if not 1 <= hari <= 28:
+            if not 1 <= hari <= 31:
                 raise ValueError
         except ValueError:
             await update.message.reply_text(
-                "⚠️ Kirim satu angka dari *1 sampai 28*. Contoh: `25`.",
+                "⚠️ Kirim satu angka dari *1 sampai 31*. Contoh: `1` atau `25`.",
                 parse_mode="Markdown",
             )
             return
